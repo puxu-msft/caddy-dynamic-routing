@@ -1,0 +1,108 @@
+# golangci-lint configuration for caddy-dynamic-routing
+# See https://golangci-lint.run/usage/configuration/
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    # Default linters
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    # Additional linters
+    - bodyclose
+    - dogsled
+    - dupl
+    - exportloopref
+    - gochecknoinits
+    - goconst
+    - gocritic
+    - gocyclo
+    - gofmt
+    - goimports
+    - goprintffuncname
+    - gosec
+    - misspell
+    - nakedret
+    - noctx
+    - nolintlint
+    - prealloc
+    - revive
+    - rowserrcheck
+    - stylecheck
+    - unconvert
+    - unparam
+    - whitespace
+
+linters-settings:
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment  # Too strict for this project
+
+  gocyclo:
+    min-complexity: 20
+
+  goconst:
+    min-len: 3
+    min-occurrences: 3
+
+  misspell:
+    locale: US
+
+  goimports:
+    local-prefixes: github.com/puxu-msft/caddy-dynamic-routing
+
+  revive:
+    rules:
+      - name: blank-imports
+      - name: context-as-argument
+      - name: context-keys-type
+      - name: dot-imports
+      - name: error-return
+      - name: error-strings
+      - name: error-naming
+      - name: exported
+      - name: if-return
+      - name: increment-decrement
+      - name: var-naming
+      - name: var-declaration
+      - name: package-comments
+      - name: range
+      - name: receiver-naming
+      - name: time-naming
+      - name: unexported-return
+      - name: indent-error-flow
+      - name: errorf
+      - name: empty-block
+      - name: superfluous-else
+      - name: unreachable-code
+
+  gosec:
+    excludes:
+      - G104  # Unhandled errors (too noisy)
+      - G304  # File path provided as taint input (expected for config files)
+
+  dupl:
+    threshold: 150
+
+issues:
+  exclude-rules:
+    # Exclude some linters from running on tests files
+    - path: _test\.go
+      linters:
+        - dupl
+        - gosec
+        - goconst
+
+    # Exclude known false positives
+    - path: datasource/
+      text: "G402:"  # TLS InsecureSkipVerify is configurable
+
+  max-issues-per-linter: 50
+  max-same-issues: 10

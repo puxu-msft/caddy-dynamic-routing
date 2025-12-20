@@ -1,0 +1,58 @@
+# GoReleaser configuration for caddy-dynamic-routing
+# See https://goreleaser.com/customization/
+
+version: 2
+
+project_name: caddy-dynamic-routing
+
+before:
+  hooks:
+    - go mod tidy
+    - go mod verify
+
+builds:
+  - skip: true  # We use xcaddy for building, not direct go build
+
+# Since this is a Caddy plugin, we provide source releases
+# Users should build with: xcaddy build --with github.com/puxu-msft/caddy-dynamic-routing@v0.1.0
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: puxu-msft
+    name: caddy-dynamic-routing
+
+  draft: false
+  prerelease: auto
+
+  header: |
+    ## caddy-dynamic-routing {{ .Tag }}
+
+    ### Installation
+
+    Build Caddy with this plugin:
+    ```bash
+    xcaddy build --with github.com/puxu-msft/caddy-dynamic-routing@{{ .Tag }}
+    ```
+
+  footer: |
+    ---
+
+    **Full Changelog**: https://github.com/puxu-msft/caddy-dynamic-routing/compare/{{ .PreviousTag }}...{{ .Tag }}

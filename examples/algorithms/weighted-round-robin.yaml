@@ -1,0 +1,18 @@
+# Weighted Round Robin Example
+# Requests are distributed sequentially based on weights
+# With weights 5:3:2, the pattern repeats every 10 requests:
+# backend1, backend1, backend1, backend1, backend1,
+# backend2, backend2, backend2,
+# backend3, backend3
+
+rules:
+  - upstreams:
+      - address: backend1:8080
+        weight: 5
+      - address: backend2:8080
+        weight: 3
+      - address: backend3:8080
+        weight: 2
+
+algorithm: weighted_round_robin
+description: "Production traffic distribution"

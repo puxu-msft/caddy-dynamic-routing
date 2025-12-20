@@ -1,0 +1,54 @@
+{
+  "admin": {
+    "listen": "localhost:2019"
+  },
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [":443"],
+          "routes": [
+            {
+              "match": [
+                {
+                  "host": ["example.com"]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [
+                    {"dial": "backend1:8080"},
+                    {"dial": "backend2:8080"},
+                    {"dial": "backend3:8080"}
+                  ],
+                  "selection_policy": {
+                    "policy": "dynamic",
+                    "key": "{http.request.header.X-Tenant}",
+                    "data_source": {
+                      "source": "etcd",
+                      "endpoints": ["localhost:2379"],
+                      "prefix": "/caddy/routing/",
+                      "dial_timeout": "5s",
+                      "request_timeout": "2s"
+                    },
+                    "fallback": {
+                      "policy": "random"
+                    }
+                  },
+                  "health_checks": {
+                    "active": {
+                      "uri": "/health",
+                      "interval": "10s",
+                      "timeout": "5s"
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

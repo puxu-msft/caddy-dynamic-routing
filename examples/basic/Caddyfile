@@ -1,0 +1,21 @@
+{
+    admin :2019
+}
+
+:80 {
+    reverse_proxy backend1:80 backend2:80 backend3:80 {
+        lb_policy dynamic {
+            key {http.request.header.X-Tenant}
+
+            etcd {
+                endpoints etcd:2379
+                prefix /caddy/routing/
+            }
+
+            fallback random
+        }
+
+        health_uri /health
+        health_interval 10s
+    }
+}

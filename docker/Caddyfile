@@ -1,0 +1,33 @@
+# Caddyfile for testing dynamic selection policy
+{
+    admin 0.0.0.0:2019
+    debug
+}
+
+:8080 {
+    log {
+        output stdout
+        format console
+        level DEBUG
+    }
+
+    reverse_proxy backend-a:5678 backend-b:5678 backend-default:5678 {
+        lb_policy dynamic {
+            key {http.request.header.X-Tenant}
+
+            etcd {
+                endpoints etcd:2379
+                prefix /caddy/routing/
+                dial_timeout 5s
+                request_timeout 2s
+            }
+
+            fallback random
+        }
+
+        # Health checks
+        health_uri /
+        health_interval 10s
+        health_timeout 5s
+    }
+}

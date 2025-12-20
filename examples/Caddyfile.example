@@ -1,0 +1,80 @@
+# Example Caddyfile with Dynamic Selection Policy
+#
+# This example demonstrates how to use the dynamic selection policy
+# to route requests based on tenant information from an X-Tenant header.
+
+example.com {
+    reverse_proxy backend1:8080 backend2:8080 backend3:8080 {
+        # Use dynamic selection policy
+        lb_policy dynamic {
+            # Extract routing key from X-Tenant header
+            key {http.request.header.X-Tenant}
+
+            # etcd data source configuration
+            etcd {
+                endpoints localhost:2379
+                prefix /caddy/routing/
+                dial_timeout 5s
+                request_timeout 2s
+
+                # Optional authentication
+                # username admin
+                # password secret
+
+                # Optional TLS configuration
+                # tls {
+                #     cert /etc/caddy/etcd-client.crt
+                #     key /etc/caddy/etcd-client.key
+                #     ca /etc/caddy/etcd-ca.crt
+                # }
+            }
+
+            # Fallback policy when no route is found
+            fallback random
+        }
+
+        # Health checks
+        health_uri /health
+        health_interval 10s
+        health_timeout 5s
+    }
+}
+
+# Example with composite key (multiple sources)
+api.example.com {
+    reverse_proxy api1:8080 api2:8080 api3:8080 {
+        lb_policy dynamic {
+            # Composite key: organization + region
+            key {header.X-Org}-{cookie.region}
+
+            etcd {
+                endpoints localhost:2379
+                prefix /caddy/api-routing/
+            }
+
+            fallback round_robin
+        }
+    }
+}
+
+# Example with query parameter routing
+service.example.com {
+    reverse_proxy svc1:8080 svc2:8080 {
+        lb_policy dynamic {
+            # Route based on query parameter
+            key {query.tenant}
+
+            etcd {
+                endpoints etcd1:2379 etcd2:2379 etcd3:2379
+                prefix /caddy/service-routing/
+                dial_timeout 3s
+            }
+
+            fallback least_conn
+        }
+
+        # Enable passive health checks
+        fail_duration 30s
+        max_fails 3
+    }
+}

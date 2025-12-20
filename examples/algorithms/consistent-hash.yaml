@@ -1,0 +1,17 @@
+# Consistent Hash Example
+# Uses virtual nodes for better distribution
+# Same cache key always routes to the same backend
+# Adding/removing backends only affects a portion of keys
+
+rules:
+  - upstreams:
+      - address: cache1:8080
+        weight: 1
+      - address: cache2:8080
+        weight: 1
+      - address: cache3:8080
+        weight: 1
+
+algorithm: consistent_hash
+algorithm_key: X-Cache-Key
+description: "Cache cluster with consistent hashing"
