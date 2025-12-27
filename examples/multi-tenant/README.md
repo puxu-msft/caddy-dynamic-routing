@@ -6,6 +6,13 @@ Complete example for a multi-tenant SaaS application with:
 - Traffic shifting
 - Fallback handling
 
+Navigation:
+
+- Back to examples index: [../README.md](../README.md)
+- Algorithms: [../algorithms/README.md](../algorithms/README.md)
+- Data sources: [../datasources/README.md](../datasources/README.md)
+- Docker environment: [../docker/README.md](../docker/README.md)
+
 ## Architecture
 
 ```
@@ -139,11 +146,13 @@ etcdctl put /saas/upstreams/tenant-enterprise '{
 }'
 ```
 
-## Run with Docker Compose
+## Run with Docker
 
 ```bash
-cd examples/multi-tenant
-docker compose up -d
+cd examples/docker
+docker compose up --build -d
 ```
 
-See [docker-compose.yaml](docker-compose.yaml) for the complete setup.
+This example does not ship a dedicated Compose stack. Start from the canonical environment: [../docker/README.md](../docker/README.md)
+
+Then adapt the Caddy config and etcd key prefixes from this document to your environment.

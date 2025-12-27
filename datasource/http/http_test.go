@@ -40,9 +40,15 @@ func TestHTTPSourceIntegration(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 			// If it's already JSON, write as-is; otherwise wrap as simple upstream
 			if json.Valid([]byte(value)) {
-				w.Write([]byte(value))
+				if _, err := w.Write([]byte(value)); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
 			} else {
-				json.NewEncoder(w).Encode(value)
+				if err := json.NewEncoder(w).Encode(value); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
 			}
 		} else {
 			w.WriteHeader(http.StatusNotFound)
@@ -133,7 +139,10 @@ func TestHTTPSourceWithHeaders(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedAuth = r.Header.Get("Authorization")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`"backend:8080"`))
+		if _, err := w.Write([]byte(`"backend:8080"`)); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}))
 	defer server.Close()
 
@@ -157,7 +166,9 @@ func TestHTTPSourceWithHeaders(t *testing.T) {
 	source.healthy.Store(true)
 
 	ctx := context.Background()
-	source.Get(ctx, "test")
+	if _, err := source.Get(ctx, "test"); err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
 
 	if receivedAuth != "Bearer test-token" {
 		t.Errorf("Expected Authorization header 'Bearer test-token', got '%s'", receivedAuth)

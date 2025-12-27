@@ -1,0 +1,47 @@
+{
+    admin :2019
+}
+
+example.com {
+    reverse_proxy {
+        lb_policy dynamic {
+            key {http.request.header.X-Tenant}
+
+            # Choose ONE of the following sql blocks.
+
+            # --- Full refresh (default) ---
+            # sql {
+            #     driver postgres
+            #     dsn postgres://user:pass@localhost:5432/routing?sslmode=disable
+            #     table routing_configs
+            #     key_column routing_key
+            #     config_column config
+            #     poll_interval 30s
+            #     initial_load_timeout 30s
+            # }
+
+            # --- Incremental refresh (cursor-based) ---
+            sql {
+                driver postgres
+                dsn postgres://user:pass@localhost:5432/routing?sslmode=disable
+                table routing_configs
+                key_column routing_key
+                config_column config
+
+                poll_interval 2s
+                refresh_mode incremental
+                updated_at_column updated_at
+
+                # Optional: soft delete support
+                # deleted_at_column deleted_at
+
+                # Optional: periodic full reconcile
+                full_refresh_interval 5m
+
+                initial_load_timeout 30s
+            }
+
+            fallback random
+        }
+    }
+}

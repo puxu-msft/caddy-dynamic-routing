@@ -1,5 +1,5 @@
 services:
-  # etcd - 配置存储
+  # etcd - configuration store
   etcd:
     image: quay.io/coreos/etcd:v3.5.17
     container_name: caddy-dynamic-routing-etcd
@@ -18,7 +18,7 @@ services:
       timeout: 3s
       retries: 5
 
-  # 后端服务 1 - Tenant A
+  # backend service - Tenant A
   backend-a:
     image: hashicorp/http-echo:latest
     container_name: caddy-dynamic-routing-backend-a
@@ -26,7 +26,7 @@ services:
     expose:
       - "5678"
 
-  # 后端服务 2 - Tenant B
+  # backend service - Tenant B
   backend-b:
     image: hashicorp/http-echo:latest
     container_name: caddy-dynamic-routing-backend-b
@@ -34,7 +34,7 @@ services:
     expose:
       - "5678"
 
-  # 后端服务 3 - 默认
+  # backend service - Default
   backend-default:
     image: hashicorp/http-echo:latest
     container_name: caddy-dynamic-routing-backend-default
@@ -42,15 +42,15 @@ services:
     expose:
       - "5678"
 
-  # Caddy with dynamic selection policy
+  # Caddy with this plugin
   caddy:
     build:
-      context: ..
+      context: ../..
       dockerfile: docker/Dockerfile
     container_name: caddy-dynamic-routing-caddy
     ports:
       - "8080:8080"
-      - "2019:2019"  # Admin API
+      - "2019:2019" # Admin API
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
     depends_on:
@@ -63,7 +63,7 @@ services:
       backend-default:
         condition: service_started
 
-  # etcd 初始化 - 设置路由规则
+  # etcd initialization - set up routing rules
   etcd-init:
     image: alpine:latest
     container_name: caddy-dynamic-routing-etcd-init
@@ -73,20 +73,16 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        # Install etcdctl
         apk add --no-cache etcd-ctl
 
         echo "Setting up routing rules in etcd..."
 
-        # 简单路由: tenant-a -> backend-a
         etcdctl --endpoints=http://etcd:2379 put /caddy/routing/tenant-a "backend-a:5678"
         echo "Added route: tenant-a -> backend-a:5678"
 
-        # 简单路由: tenant-b -> backend-b
         etcdctl --endpoints=http://etcd:2379 put /caddy/routing/tenant-b "backend-b:5678"
         echo "Added route: tenant-b -> backend-b:5678"
 
-        # JSON 规则路由: tenant-advanced (带条件)
         etcdctl --endpoints=http://etcd:2379 put /caddy/routing/tenant-advanced '{
           "rules": [
             {

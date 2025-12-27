@@ -18,6 +18,7 @@ import (
 
 	"github.com/puxu-msft/caddy-dynamic-routing/datasource"
 	"github.com/puxu-msft/caddy-dynamic-routing/datasource/cache"
+	"github.com/puxu-msft/caddy-dynamic-routing/metrics"
 )
 
 func init() {
@@ -41,6 +42,11 @@ type ZookeeperSource struct {
 	// Default is 10000.
 	MaxCacheSize int `json:"max_cache_size,omitempty"`
 
+	// InitialLoadTimeout is the maximum time allowed for the initial load during
+	// Provision.
+	// Default: 30s
+	InitialLoadTimeout caddy.Duration `json:"initial_load_timeout,omitempty"`
+
 	// Username for SASL authentication.
 	Username string `json:"username,omitempty"`
 
@@ -52,6 +58,8 @@ type ZookeeperSource struct {
 	cache     *cache.RouteCache
 	healthy   atomic.Bool
 	logger    *zap.Logger
+	adminName string
+	lastError atomic.Value // string
 	ctx       context.Context
 	cancel    context.CancelFunc
 	watcherWg sync.WaitGroup
@@ -85,7 +93,7 @@ func (z *ZookeeperSource) Provision(ctx caddy.Context) error {
 	z.cache = cache.NewRouteCache(z.MaxCacheSize)
 
 	// Create context for watchers
-	z.ctx, z.cancel = context.WithCancel(context.Background())
+	z.ctx, z.cancel = context.WithCancel(ctx.Context)
 
 	// Connect to Zookeeper
 	conn, eventChan, err := zk.Connect(z.Servers, time.Duration(z.SessionTimeout))
@@ -107,11 +115,19 @@ func (z *ZookeeperSource) Provision(ctx caddy.Context) error {
 	go z.handleSessionEvents(eventChan)
 
 	// Initial load
-	if err := z.initialLoad(); err != nil {
+	loadTimeout := time.Duration(z.InitialLoadTimeout)
+	if loadTimeout == 0 {
+		loadTimeout = datasource.DefaultInitialLoadTimeout
+	}
+	loadCtx, cancel := context.WithTimeout(z.ctx, loadTimeout)
+	defer cancel()
+	if err := z.initialLoad(loadCtx); err != nil {
 		z.logger.Warn("initial zookeeper load failed", zap.Error(err))
+		z.lastError.Store(err.Error())
 		z.healthy.Store(false)
 	} else {
 		z.healthy.Store(true)
+		z.lastError.Store("")
 	}
 
 	// Start watchers
@@ -122,11 +138,17 @@ func (z *ZookeeperSource) Provision(ctx caddy.Context) error {
 		zap.Strings("servers", z.Servers),
 		zap.String("base_path", z.BasePath))
 
+	// Register for Admin API inspection
+	z.adminName = datasource.RegisterAdminSource(z)
+
 	return nil
 }
 
 // Cleanup releases Zookeeper resources.
 func (z *ZookeeperSource) Cleanup() error {
+	datasource.UnregisterAdminSource(z.adminName)
+	z.adminName = ""
+
 	if z.cancel != nil {
 		z.cancel()
 	}
@@ -172,14 +194,17 @@ func (z *ZookeeperSource) Get(ctx context.Context, key string) (*datasource.Rout
 				z.cache.SetNegative(key)
 				return nil, nil
 			}
+			z.lastError.Store(err.Error())
 			return nil, fmt.Errorf("failed to get znode %s: %w", nodePath, err)
 		}
 
 		config, err := datasource.ParseRouteConfig(data)
 		if err != nil {
+			metrics.RecordRouteConfigParseError(z.AdminType())
 			z.logger.Warn("failed to parse route config",
 				zap.String("key", key),
 				zap.Error(err))
+			z.lastError.Store(err.Error())
 			return nil, nil
 		}
 
@@ -191,10 +216,60 @@ func (z *ZookeeperSource) Get(ctx context.Context, key string) (*datasource.Rout
 	if err != nil {
 		return nil, err
 	}
+	z.lastError.Store("")
 	if result == nil {
 		return nil, nil
 	}
 	return result.(*datasource.RouteConfig), nil
+}
+
+// AdminType returns the short type name for Admin API.
+func (*ZookeeperSource) AdminType() string { return "zookeeper" }
+
+// AdminLastError returns the most recent error message (best-effort).
+func (z *ZookeeperSource) AdminLastError() string {
+	if v := z.lastError.Load(); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// AdminListRoutes returns a snapshot of cached routes.
+func (z *ZookeeperSource) AdminListRoutes() []datasource.AdminRouteInfo {
+	if z.cache == nil {
+		return nil
+	}
+	routes := make([]datasource.AdminRouteInfo, 0, z.cache.Len())
+	z.cache.Range(func(key string, cfg *datasource.RouteConfig) bool {
+		routes = append(routes, datasource.SummarizeRouteConfig(key, cfg))
+		return true
+	})
+	return routes
+}
+
+// AdminCacheStats returns a snapshot of internal cache stats.
+func (z *ZookeeperSource) AdminCacheStats() datasource.AdminCacheStats {
+	if z.cache == nil {
+		return datasource.AdminCacheStats{}
+	}
+	h, m, nh, hr := z.cache.Stats()
+	return datasource.AdminCacheStats{
+		Entries:      z.cache.Len(),
+		MaxSize:      z.cache.MaxSize(),
+		Hits:         h,
+		Misses:       m,
+		NegativeHits: nh,
+		HitRate:      hr,
+	}
+}
+
+// AdminClearCache clears all internal caches.
+func (z *ZookeeperSource) AdminClearCache() {
+	if z.cache != nil {
+		z.cache.Clear()
+	}
 }
 
 // Healthy returns the health status of the Zookeeper connection.
@@ -203,7 +278,13 @@ func (z *ZookeeperSource) Healthy() bool {
 }
 
 // initialLoad loads all existing configurations from Zookeeper.
-func (z *ZookeeperSource) initialLoad() error {
+func (z *ZookeeperSource) initialLoad(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	// Ensure base path exists
 	exists, _, err := z.conn.Exists(z.BasePath)
 	if err != nil {
@@ -222,6 +303,12 @@ func (z *ZookeeperSource) initialLoad() error {
 	}
 
 	for _, child := range children {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		nodePath := path.Join(z.BasePath, child)
 		data, _, err := z.conn.Get(nodePath)
 		if err != nil {
@@ -231,6 +318,7 @@ func (z *ZookeeperSource) initialLoad() error {
 
 		config, err := datasource.ParseRouteConfig(data)
 		if err != nil {
+			metrics.RecordRouteConfigParseError(z.AdminType())
 			z.logger.Warn("failed to parse config", zap.String("key", child), zap.Error(err))
 			continue
 		}
@@ -329,6 +417,7 @@ func (z *ZookeeperSource) watchNode(key string) {
 		// Update cache
 		config, err := datasource.ParseRouteConfig(data)
 		if err != nil {
+			metrics.RecordRouteConfigParseError(z.AdminType())
 			z.logger.Warn("failed to parse config", zap.String("key", key), zap.Error(err))
 		} else {
 			z.cache.Set(key, config)
@@ -376,6 +465,15 @@ func (z *ZookeeperSource) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid session_timeout: %v", err)
 				}
 				z.SessionTimeout = caddy.Duration(dur)
+			case "initial_load_timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("invalid initial_load_timeout: %v", err)
+				}
+				z.InitialLoadTimeout = caddy.Duration(dur)
 			case "max_cache_size":
 				if !d.NextArg() {
 					return d.ArgErr()

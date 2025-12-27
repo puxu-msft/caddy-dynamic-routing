@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -69,6 +70,10 @@ type CompositeSource struct {
 	sources []datasource.DataSource
 	cache   sync.Map // map[string]*cachedResult
 	logger  *zap.Logger
+
+	// Admin / diagnostics
+	adminName string
+	lastError atomic.Value // string
 }
 
 // log returns the logger, defaulting to a no-op logger if nil.
@@ -133,11 +138,17 @@ func (c *CompositeSource) Provision(ctx caddy.Context) error {
 		zap.Bool("parallel", c.Parallel),
 	)
 
+	// Register for Admin API inspection
+	c.adminName = datasource.RegisterAdminSource(c)
+
 	return nil
 }
 
 // Cleanup releases resources.
 func (c *CompositeSource) Cleanup() error {
+	datasource.UnregisterAdminSource(c.adminName)
+	c.adminName = ""
+
 	var errs []error
 	for _, src := range c.sources {
 		if err := src.Cleanup(); err != nil {
@@ -187,7 +198,75 @@ func (c *CompositeSource) Get(ctx context.Context, key string) (*datasource.Rout
 		})
 	}
 
+	if err != nil {
+		c.lastError.Store(err.Error())
+	} else {
+		c.lastError.Store("")
+	}
+
 	return config, err
+}
+
+// AdminType returns the short type name for Admin API.
+func (*CompositeSource) AdminType() string { return "composite" }
+
+// AdminLastError returns the most recent error message (best-effort).
+func (c *CompositeSource) AdminLastError() string {
+	if v := c.lastError.Load(); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// AdminListRoutes returns a snapshot of cached combined routes (only when CacheResults is enabled).
+func (c *CompositeSource) AdminListRoutes() []datasource.AdminRouteInfo {
+	if !c.CacheResults {
+		return nil
+	}
+
+	routes := make([]datasource.AdminRouteInfo, 0)
+	c.cache.Range(func(k, v any) bool {
+		key, ok := k.(string)
+		if !ok {
+			return true
+		}
+		cr, ok := v.(*cachedResult)
+		if !ok {
+			return true
+		}
+		routes = append(routes, datasource.SummarizeRouteConfig(key, cr.config))
+		return true
+	})
+	return routes
+}
+
+// AdminCacheStats returns a snapshot of the combined-results cache.
+func (c *CompositeSource) AdminCacheStats() datasource.AdminCacheStats {
+	if !c.CacheResults {
+		return datasource.AdminCacheStats{}
+	}
+	entries := 0
+	c.cache.Range(func(_, _ any) bool {
+		entries++
+		return true
+	})
+	return datasource.AdminCacheStats{
+		Entries: entries,
+		MaxSize: 0,
+		Hits:    0,
+		Misses:  0,
+		HitRate: 0,
+	}
+}
+
+// AdminClearCache clears the combined-results cache.
+func (c *CompositeSource) AdminClearCache() {
+	c.cache.Range(func(k, _ any) bool {
+		c.cache.Delete(k)
+		return true
+	})
 }
 
 // getFailover tries each healthy source in order until one returns a result.
@@ -230,12 +309,12 @@ func (c *CompositeSource) getMerge(ctx context.Context, key string) (*datasource
 	defer cancel()
 
 	if c.Parallel {
-		return c.getMergeParallel(timeoutCtx, key)
+		return c.getMergeParallel(timeoutCtx, key), nil
 	}
-	return c.getMergeSequential(timeoutCtx, key)
+	return c.getMergeSequential(timeoutCtx, key), nil
 }
 
-func (c *CompositeSource) getMergeSequential(ctx context.Context, key string) (*datasource.RouteConfig, error) {
+func (c *CompositeSource) getMergeSequential(ctx context.Context, key string) *datasource.RouteConfig {
 	var merged *datasource.RouteConfig
 
 	for i, src := range c.sources {
@@ -259,10 +338,10 @@ func (c *CompositeSource) getMergeSequential(ctx context.Context, key string) (*
 		}
 	}
 
-	return merged, nil
+	return merged
 }
 
-func (c *CompositeSource) getMergeParallel(ctx context.Context, key string) (*datasource.RouteConfig, error) {
+func (c *CompositeSource) getMergeParallel(ctx context.Context, key string) *datasource.RouteConfig {
 	type result struct {
 		index  int
 		config *datasource.RouteConfig
@@ -312,7 +391,7 @@ func (c *CompositeSource) getMergeParallel(ctx context.Context, key string) (*da
 		}
 	}
 
-	return merged, nil
+	return merged
 }
 
 // mergeConfig merges src into dst, with src taking precedence for non-empty fields.

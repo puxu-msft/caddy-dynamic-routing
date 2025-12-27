@@ -58,8 +58,10 @@ lint:
 	@echo "Running linter..."
 	@if command -v golangci-lint >/dev/null 2>&1; then \
 		golangci-lint run ./...; \
+	elif [ -x "$$($(GOCMD) env GOPATH)/bin/golangci-lint" ]; then \
+		"$$($(GOCMD) env GOPATH)/bin/golangci-lint" run ./...; \
 	else \
-		echo "golangci-lint not installed. Run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest"; \
+		echo "golangci-lint not installed. Run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.7.2"; \
 	fi
 
 ## vet: Run go vet
@@ -106,12 +108,12 @@ clean:
 ## docker-up: Start docker compose services for testing
 docker-up:
 	@echo "Starting docker services..."
-	docker compose -f docker/docker-compose.yml up -d
+	docker compose -f examples/docker/docker-compose.yml up -d
 
 ## docker-down: Stop docker compose services
 docker-down:
 	@echo "Stopping docker services..."
-	docker compose -f docker/docker-compose.yml down
+	docker compose -f examples/docker/docker-compose.yml down
 
 ## check: Run all checks (fmt, vet, lint, test)
 check: fmt-check vet lint test

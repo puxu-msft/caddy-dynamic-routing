@@ -43,11 +43,11 @@ func (m *mockUpstreamDataSource) Healthy() bool {
 
 func TestDynamicUpstreams_GetUpstreams(t *testing.T) {
 	tests := []struct {
-		name           string
-		configs        map[string]*datasource.RouteConfig
-		defaultKey     string
-		expectedCount  int
-		expectedAddrs  []string
+		name          string
+		configs       map[string]*datasource.RouteConfig
+		defaultKey    string
+		expectedCount int
+		expectedAddrs []string
 	}{
 		{
 			name: "simple upstream",

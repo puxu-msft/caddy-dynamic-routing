@@ -97,15 +97,24 @@ type RedisSource struct {
 	// Default: 10000
 	MaxCacheSize int `json:"max_cache_size,omitempty"`
 
+	// InitialLoadTimeout is the maximum time allowed for the initial load during
+	// Provision.
+	// Default: DialTimeout
+	InitialLoadTimeout caddy.Duration `json:"initial_load_timeout,omitempty"`
+
 	// Internal state
 	client          redis.UniversalClient
 	cache           *cache.RouteCache
 	healthy         atomic.Bool
 	logger          *zap.Logger
 	cancelPubSub    context.CancelFunc
-	sfGroup         singleflight.Group        // Coalesce concurrent requests for same key
+	sfGroup         singleflight.Group // Coalesce concurrent requests for same key
 	poolCollector   *metrics.PoolStatsCollector
 	cancelPoolStats context.CancelFunc
+
+	// Admin / diagnostics
+	adminName string
+	lastError atomic.Value // string
 }
 
 // SentinelConfig holds Redis Sentinel configuration.
@@ -150,22 +159,26 @@ func (r *RedisSource) Provision(ctx caddy.Context) error {
 	r.cache = cache.NewRouteCache(r.MaxCacheSize)
 
 	// Create Redis client
-	var err error
-	r.client, err = r.createClient()
-	if err != nil {
-		return fmt.Errorf("creating Redis client: %v", err)
-	}
+	r.client = r.createClient()
 
 	// Initial health check and data load
-	if err := r.initialLoad(ctx); err != nil {
+	loadCtx := ctx.Context
+	if r.InitialLoadTimeout != 0 {
+		c, cancel := context.WithTimeout(ctx.Context, time.Duration(r.InitialLoadTimeout))
+		defer cancel()
+		loadCtx = c
+	}
+	if err := r.initialLoad(loadCtx); err != nil {
 		r.logger.Warn("initial Redis load failed, will retry", zap.Error(err))
+		r.lastError.Store(err.Error())
 		r.healthy.Store(false)
 	} else {
 		r.healthy.Store(true)
+		r.lastError.Store("")
 	}
 
 	// Start PubSub subscriber for real-time updates
-	pubsubCtx, cancel := context.WithCancel(context.Background())
+	pubsubCtx, cancel := context.WithCancel(ctx.Context)
 	r.cancelPubSub = cancel
 	go r.subscribeLoop(pubsubCtx)
 
@@ -179,11 +192,14 @@ func (r *RedisSource) Provision(ctx caddy.Context) error {
 		zap.Int("max_cache_size", r.MaxCacheSize),
 	)
 
+	// Register for Admin API inspection
+	r.adminName = datasource.RegisterAdminSource(r)
+
 	return nil
 }
 
 // createClient creates the appropriate Redis client based on configuration.
-func (r *RedisSource) createClient() (redis.UniversalClient, error) {
+func (r *RedisSource) createClient() redis.UniversalClient {
 	var tlsConfig *tls.Config
 	if r.TLSEnabled {
 		tlsConfig = &tls.Config{
@@ -209,7 +225,7 @@ func (r *RedisSource) createClient() (redis.UniversalClient, error) {
 			PoolTimeout:     time.Duration(r.PoolTimeout),
 			ConnMaxIdleTime: time.Duration(r.ConnMaxIdleTime),
 			ConnMaxLifetime: time.Duration(r.ConnMaxLifetime),
-		}), nil
+		})
 	}
 
 	// Cluster mode
@@ -227,7 +243,7 @@ func (r *RedisSource) createClient() (redis.UniversalClient, error) {
 			PoolTimeout:     time.Duration(r.PoolTimeout),
 			ConnMaxIdleTime: time.Duration(r.ConnMaxIdleTime),
 			ConnMaxLifetime: time.Duration(r.ConnMaxLifetime),
-		}), nil
+		})
 	}
 
 	// Standalone mode
@@ -249,11 +265,14 @@ func (r *RedisSource) createClient() (redis.UniversalClient, error) {
 		PoolTimeout:     time.Duration(r.PoolTimeout),
 		ConnMaxIdleTime: time.Duration(r.ConnMaxIdleTime),
 		ConnMaxLifetime: time.Duration(r.ConnMaxLifetime),
-	}), nil
+	})
 }
 
 // Cleanup releases resources.
 func (r *RedisSource) Cleanup() error {
+	datasource.UnregisterAdminSource(r.adminName)
+	r.adminName = ""
+
 	if r.cancelPoolStats != nil {
 		r.cancelPoolStats()
 	}
@@ -358,13 +377,16 @@ func (r *RedisSource) Get(ctx context.Context, key string) (*datasource.RouteCon
 		}
 		if err != nil {
 			r.logger.Warn("Redis get failed", zap.String("key", fullKey), zap.Error(err))
+			r.lastError.Store(err.Error())
 			return nil, err
 		}
 
 		// Parse and cache the config
 		config, err := datasource.ParseRouteConfig([]byte(val))
 		if err != nil {
+			metrics.RecordRouteConfigParseError(r.AdminType())
 			r.logger.Error("failed to parse route config", zap.String("key", fullKey), zap.Error(err))
+			r.lastError.Store(err.Error())
 			return nil, err
 		}
 
@@ -378,10 +400,62 @@ func (r *RedisSource) Get(ctx context.Context, key string) (*datasource.RouteCon
 	if err != nil {
 		return nil, err
 	}
+	r.lastError.Store("")
 	if result == nil {
 		return nil, nil
 	}
 	return result.(*datasource.RouteConfig), nil
+}
+
+// AdminType returns the short type name for Admin API.
+func (*RedisSource) AdminType() string { return "redis" }
+
+// AdminLastError returns the most recent error message (best-effort).
+func (r *RedisSource) AdminLastError() string {
+	if v := r.lastError.Load(); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// AdminListRoutes returns a snapshot of cached routes.
+func (r *RedisSource) AdminListRoutes() []datasource.AdminRouteInfo {
+	if r.cache == nil {
+		return nil
+	}
+
+	routes := make([]datasource.AdminRouteInfo, 0, r.cache.Len())
+	r.cache.Range(func(k string, cfg *datasource.RouteConfig) bool {
+		key := strings.TrimPrefix(k, r.Prefix)
+		routes = append(routes, datasource.SummarizeRouteConfig(key, cfg))
+		return true
+	})
+	return routes
+}
+
+// AdminCacheStats returns a snapshot of internal cache stats.
+func (r *RedisSource) AdminCacheStats() datasource.AdminCacheStats {
+	if r.cache == nil {
+		return datasource.AdminCacheStats{}
+	}
+	h, m, nh, hr := r.cache.Stats()
+	return datasource.AdminCacheStats{
+		Entries:      r.cache.Len(),
+		MaxSize:      r.cache.MaxSize(),
+		Hits:         h,
+		Misses:       m,
+		NegativeHits: nh,
+		HitRate:      hr,
+	}
+}
+
+// AdminClearCache clears all internal caches.
+func (r *RedisSource) AdminClearCache() {
+	if r.cache != nil {
+		r.cache.Clear()
+	}
 }
 
 // Healthy returns true if the Redis connection is healthy.
@@ -390,13 +464,17 @@ func (r *RedisSource) Healthy() bool {
 }
 
 // initialLoad loads all existing routing configurations from Redis.
-func (r *RedisSource) initialLoad(ctx caddy.Context) error {
-	reqCtx, cancel := context.WithTimeout(context.Background(), time.Duration(r.DialTimeout))
+func (r *RedisSource) initialLoad(ctx context.Context) error {
+	timeout := time.Duration(r.DialTimeout)
+	if r.InitialLoadTimeout != 0 {
+		timeout = time.Duration(r.InitialLoadTimeout)
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	// Ping to verify connection
 	if err := r.client.Ping(reqCtx).Err(); err != nil {
-		return fmt.Errorf("Redis ping failed: %v", err)
+		return fmt.Errorf("redis ping failed: %v", err)
 	}
 
 	// Scan for all keys with prefix
@@ -405,7 +483,7 @@ func (r *RedisSource) initialLoad(ctx caddy.Context) error {
 	for {
 		keys, nextCursor, err := r.client.Scan(reqCtx, cursor, r.Prefix+"*", 100).Result()
 		if err != nil {
-			return fmt.Errorf("Redis scan failed: %v", err)
+			return fmt.Errorf("redis scan failed: %v", err)
 		}
 
 		if len(keys) > 0 {
@@ -424,6 +502,7 @@ func (r *RedisSource) initialLoad(ctx caddy.Context) error {
 					}
 					config, err := datasource.ParseRouteConfig([]byte(strVal))
 					if err != nil {
+						metrics.RecordRouteConfigParseError(r.AdminType())
 						r.logger.Warn("failed to parse config during initial load",
 							zap.String("key", keys[i]),
 							zap.Error(err),
@@ -501,7 +580,11 @@ func (r *RedisSource) subscribe(ctx context.Context) error {
 		// Subscribe to custom channel
 		pubsub = r.client.Subscribe(ctx, r.PubSubChannel)
 	}
-	defer pubsub.Close()
+	defer func() {
+		if err := pubsub.Close(); err != nil {
+			r.logger.Debug("failed to close pubsub", zap.Error(err))
+		}
+	}()
 
 	// Confirm subscription
 	_, err := pubsub.Receive(ctx)
@@ -550,17 +633,14 @@ func (r *RedisSource) handleMessage(ctx context.Context, msg *redis.Message) {
 		}
 	} else {
 		// Custom PubSub format: payload = "update:caddy:routing:tenant-a" or "delete:caddy:routing:tenant-a"
-		if len(msg.Payload) < 7 {
+		if key, ok := strings.CutPrefix(msg.Payload, "update:"); ok {
+			r.refreshKey(ctx, key)
 			return
 		}
-
-		if msg.Payload[:7] == "update:" {
-			key := msg.Payload[7:]
-			r.refreshKey(ctx, key)
-		} else if msg.Payload[:7] == "delete:" {
-			key := msg.Payload[7:]
+		if key, ok := strings.CutPrefix(msg.Payload, "delete:"); ok {
 			r.cache.Delete(key)
 			r.logger.Info("route config deleted", zap.String("key", key))
+			return
 		}
 	}
 }
@@ -582,6 +662,7 @@ func (r *RedisSource) refreshKey(ctx context.Context, key string) {
 
 	config, err := datasource.ParseRouteConfig([]byte(val))
 	if err != nil {
+		metrics.RecordRouteConfigParseError(r.AdminType())
 		r.logger.Warn("failed to parse refreshed config", zap.String("key", key), zap.Error(err))
 		return
 	}
@@ -594,61 +675,105 @@ func (r *RedisSource) refreshKey(ctx context.Context, key string) {
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 func (r *RedisSource) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	parseDurationArg := func(name string) (caddy.Duration, error) {
+		if !d.NextArg() {
+			return 0, d.ArgErr()
+		}
+		dur, err := caddy.ParseDuration(d.Val())
+		if err != nil {
+			return 0, d.Errf("invalid %s: %v", name, err)
+		}
+		return caddy.Duration(dur), nil
+	}
+
+	parseIntArg := func(name string) (int, error) {
+		if !d.NextArg() {
+			return 0, d.ArgErr()
+		}
+		var n int
+		if _, err := fmt.Sscanf(d.Val(), "%d", &n); err != nil {
+			return 0, d.Errf("invalid %s: %v", name, err)
+		}
+		return n, nil
+	}
+
 	for d.Next() {
-		for nesting := d.Nesting(); d.NextBlock(nesting); {
-			switch d.Val() {
-			case "addresses":
+		handlers := map[string]func() error{
+			"addresses": func() error {
 				r.Addresses = d.RemainingArgs()
 				if len(r.Addresses) == 0 {
 					return d.ArgErr()
 				}
-
-			case "password":
+				return nil
+			},
+			"addrs": func() error {
+				r.Addresses = d.RemainingArgs()
+				if len(r.Addresses) == 0 {
+					return d.ArgErr()
+				}
+				return nil
+			},
+			"addr": func() error {
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				r.Addresses = []string{d.Val()}
+				return nil
+			},
+			"password": func() error {
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
 				r.Password = d.Val()
-
-			case "db":
-				if !d.NextArg() {
-					return d.ArgErr()
+				return nil
+			},
+			"db": func() error {
+				n, err := parseIntArg("db")
+				if err != nil {
+					return err
 				}
-				var db int
-				if _, err := fmt.Sscanf(d.Val(), "%d", &db); err != nil {
-					return d.Errf("invalid db: %v", err)
-				}
-				r.DB = db
-
-			case "prefix":
+				r.DB = n
+				return nil
+			},
+			"prefix": func() error {
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
 				r.Prefix = d.Val()
-
-			case "dial_timeout":
-				if !d.NextArg() {
+				return nil
+			},
+			"dial_timeout": func() error {
+				dur, err := parseDurationArg("dial_timeout")
+				if err != nil {
+					return err
+				}
+				r.DialTimeout = dur
+				return nil
+			},
+			"read_timeout": func() error {
+				dur, err := parseDurationArg("read_timeout")
+				if err != nil {
+					return err
+				}
+				r.ReadTimeout = dur
+				return nil
+			},
+			"initial_load_timeout": func() error {
+				dur, err := parseDurationArg("initial_load_timeout")
+				if err != nil {
+					return err
+				}
+				r.InitialLoadTimeout = dur
+				return nil
+			},
+			"cluster": func() error {
+				if args := d.RemainingArgs(); len(args) != 0 {
 					return d.ArgErr()
 				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("invalid dial_timeout: %v", err)
-				}
-				r.DialTimeout = caddy.Duration(dur)
-
-			case "read_timeout":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				dur, err := caddy.ParseDuration(d.Val())
-				if err != nil {
-					return d.Errf("invalid read_timeout: %v", err)
-				}
-				r.ReadTimeout = caddy.Duration(dur)
-
-			case "cluster":
 				r.Cluster = true
-
-			case "sentinel":
+				return nil
+			},
+			"sentinel": func() error {
 				r.Sentinel = &SentinelConfig{}
 				for nesting := d.Nesting(); d.NextBlock(nesting); {
 					switch d.Val() {
@@ -671,8 +796,9 @@ func (r *RedisSource) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 						return d.Errf("unknown sentinel subdirective: %s", d.Val())
 					}
 				}
-
-			case "tls":
+				return nil
+			},
+			"tls": func() error {
 				r.TLSEnabled = true
 				for nesting := d.Nesting(); d.NextBlock(nesting); {
 					switch d.Val() {
@@ -682,18 +808,32 @@ func (r *RedisSource) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 						return d.Errf("unknown tls subdirective: %s", d.Val())
 					}
 				}
-
-			case "pubsub_channel":
+				return nil
+			},
+			"pubsub_channel": func() error {
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
 				r.PubSubChannel = d.Val()
-
-			case "keyspace_notify":
+				return nil
+			},
+			"keyspace_notify": func() error {
+				if args := d.RemainingArgs(); len(args) != 0 {
+					return d.ArgErr()
+				}
 				r.KeyspaceNotify = true
+				return nil
+			},
+		}
 
-			default:
-				return d.Errf("unknown subdirective: %s", d.Val())
+		for nesting := d.Nesting(); d.NextBlock(nesting); {
+			name := d.Val()
+			h, ok := handlers[name]
+			if !ok {
+				return d.Errf("unknown subdirective: %s", name)
+			}
+			if err := h(); err != nil {
+				return err
 			}
 		}
 	}

@@ -13,17 +13,12 @@ Configuration examples for caddy-dynamic-routing.
 | [multi-tenant/](multi-tenant/) | SaaS multi-tenant routing patterns |
 | [events/](events/) | Event subscription and monitoring |
 | [tracing/](tracing/) | OpenTelemetry integration |
-
-## Quick Start
-
-```bash
-# Run the basic example with Docker
-cd basic
-docker compose up -d
-
-# Test routing
-curl -H "X-Tenant: tenant-a" http://localhost:8080
-```
+| [admin-api/](admin-api/) | Admin API endpoints and cache ops |
+| [dev-guide/](dev-guide/) | Developer commands and common checks |
+| [docker/](docker/) | Docker-based test environment |
+| [dev-debug/](dev-debug/) | Enabling debug logs for troubleshooting |
+| [metrics-cardinality/](metrics-cardinality/) | Reducing Prometheus time-series cardinality |
+| [metrics/](metrics/) | Metrics reference (names, labels, cardinality notes) |
 
 ## Files
 

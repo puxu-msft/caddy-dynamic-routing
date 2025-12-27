@@ -290,10 +290,12 @@ func (s *UpstreamSelector) selectWeightedRandom(upstreams []datasource.WeightedU
 	}
 
 	if totalWeight <= 0 {
+		//nolint:gosec // non-cryptographic randomness is sufficient for load balancing
 		idx := rand.Intn(len(upstreams))
 		return &upstreams[idx]
 	}
 
+	//nolint:gosec // non-cryptographic randomness is sufficient for load balancing
 	target := rand.Intn(totalWeight)
 	cumulative := 0
 
@@ -339,12 +341,19 @@ func getClientIP(r *http.Request) string {
 // hashToIndex computes a consistent hash of the input and maps to an index.
 // Uses pooled FNV hasher to reduce allocations.
 func hashToIndex(input string, n int) int {
+	if n <= 0 {
+		return 0
+	}
 	h := fnvPool.Get().(hash.Hash32)
 	h.Reset()
 	h.Write([]byte(input))
-	result := int(h.Sum32() % uint32(n))
+	mod := uint64(h.Sum32()) % uint64(n)
 	fnvPool.Put(h)
-	return result
+	maxInt := uint64(^uint(0) >> 1)
+	if mod > maxInt {
+		return 0
+	}
+	return int(mod)
 }
 
 // hashString computes FNV32a hash of a string using pooled hasher.
@@ -359,9 +368,9 @@ func hashString(input string) uint32 {
 
 // ConsistentHashRing implements consistent hashing with virtual nodes.
 type ConsistentHashRing struct {
-	ring         []hashNode
-	upstreams    []datasource.WeightedUpstream
-	configHash   uint32 // Fast comparison hash
+	ring       []hashNode
+	upstreams  []datasource.WeightedUpstream
+	configHash uint32 // Fast comparison hash
 }
 
 type hashNode struct {

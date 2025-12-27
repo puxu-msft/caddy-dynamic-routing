@@ -513,14 +513,14 @@ func TestUpstreamSelector_ConcurrentConnCount(t *testing.T) {
 	// Concurrent increment/decrement
 	for i := 0; i < numGoroutines; i++ {
 		wg.Add(1)
-		go func(id int) {
+		go func() {
 			defer wg.Done()
 			addr := "backend:8080"
 			for j := 0; j < numOperations; j++ {
 				selector.IncrementConn(addr)
 				selector.DecrementConn(addr)
 			}
-		}(i)
+		}()
 	}
 
 	wg.Wait()

@@ -1,65 +1,35 @@
 # caddy-dynamic-routing Design
 
+## Contents
+
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Core Components](#core-components)
+- [Performance Optimizations](#performance-optimizations)
+- [Caddy Module Registration](#caddy-module-registration)
+- [Event System](#event-system)
+- [Observability](#observability)
+- [Known Limitations](#known-limitations)
+
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Caddy Server                            │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │                    reverse_proxy                          │  │
-│  │  ┌─────────────────────────────────────────────────────┐  │  │
-│  │  │           DynamicSelection (lb_policy)              │  │  │
-│  │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │  │  │
-│  │  │  │  Extractor  │  │   Matcher   │  │  Selector   │  │  │  │
-│  │  │  │  (key expr) │  │  (rules)    │  │ (algorithm) │  │  │  │
-│  │  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  │  │  │
-│  │  │         │                │                │         │  │  │
-│  │  │         └────────────────┼────────────────┘         │  │  │
-│  │  │                          │                          │  │  │
-│  │  │                   ┌──────▼──────┐                   │  │  │
-│  │  │                   │  DataSource │                   │  │  │
-│  │  │                   └──────┬──────┘                   │  │  │
-│  │  └──────────────────────────┼──────────────────────────┘  │  │
-│  └─────────────────────────────┼─────────────────────────────┘  │
-└────────────────────────────────┼────────────────────────────────┘
-                                 │
-     ┌───────────────────────────┼───────────────────────────┐
-     │                           │                           │
-     ▼                           ▼                           ▼
-┌─────────┐               ┌─────────────┐              ┌─────────┐
-│  etcd   │               │    Redis    │              │ Consul  │
-│         │               │             │              │         │
-└─────────┘               └─────────────┘              └─────────┘
-```
+- Caddy `reverse_proxy` delegates upstream selection to `DynamicSelection` (this module).
+- `DynamicSelection` extracts a routing key, matches rules (optional), selects an upstream, and consults a `DataSource` for per-key routing configuration.
+- Data sources may be backed by external stores (etcd/Redis/Consul/file/HTTP/SQL/Kubernetes/Zookeeper/composite).
 
 ## Project Structure
 
-```
-caddy-dynamic-routing/
-├── plugin.go              # DynamicSelection - main module
-├── caddyfile.go           # Caddyfile parser
-├── admin.go               # Admin API endpoints
-├── events.go              # Event subscription system
-├── dynamic_upstreams.go   # Dynamic upstream discovery
-├── extractor/             # Key extraction from requests
-├── matcher/               # Rule matching + selection algorithms
-├── datasource/            # Data source interface and implementations
-│   ├── types.go           # RouteConfig, DataSource interface
-│   ├── cache/             # LRU cache with negative caching
-│   ├── etcd/
-│   ├── redis/
-│   ├── consul/
-│   ├── file/
-│   ├── http/
-│   ├── composite/         # Multi-source combination
-│   ├── zookeeper/
-│   ├── sql/
-│   └── kubernetes/
-├── metrics/               # Prometheus metrics
-├── tracing/               # OpenTelemetry integration
-├── examples/              # Configuration examples
-└── docker/                # Docker test environment
-```
+- `plugin.go`: `DynamicSelection` (main module)
+- `caddyfile.go`: Caddyfile parsing
+- `admin.go`: Admin API endpoints (`/dynamic-lb/*`)
+- `events.go`: event bus + event types (optional wiring)
+- `extractor/`: routing key extraction
+- `matcher/`: rule matching + selection algorithms
+- `datasource/`: data source interface and implementations
+- `metrics/`: Prometheus metrics
+- `tracing/`: OpenTelemetry helpers
+- `examples/`: runnable configs and operational docs
+- `docker/`: docker-based test environment
 
 ## Core Components
 
@@ -67,44 +37,19 @@ caddy-dynamic-routing/
 
 Implements `reverseproxy.Selector` interface. Main entry point for routing decisions.
 
-```go
-type DynamicSelection struct {
-    Key         string              // Placeholder expression for routing key
-    DataSource  datasource.DataSource
-    Fallback    *caddyhttp.WeakString
-}
-
-func (d *DynamicSelection) Select(pool reverseproxy.UpstreamPool,
-    req *http.Request, w http.ResponseWriter) *reverseproxy.Upstream
-```
+See [plugin.go](plugin.go) for the exact struct fields and `Select(...)` signature.
 
 ### DataSource Interface
 
 All data sources implement this interface:
 
-```go
-type DataSource interface {
-    Get(ctx context.Context, key string) (*RouteConfig, error)
-    Healthy() bool
-}
-```
+See [datasource/types.go](datasource/types.go).
 
 ### RouteConfig
 
 Configuration retrieved from data sources:
 
-```go
-type RouteConfig struct {
-    Upstream     string      // Simple: single upstream
-    Upstreams    []Upstream  // Multiple upstreams with weights
-    Rules        []Rule      // Conditional routing rules
-    Algorithm    string      // Load balancing algorithm
-    AlgorithmKey string      // Key for hash-based algorithms
-    Fallback     string      // Fallback policy
-    Version      int         // Configuration version
-    Enabled      bool        // Enable/disable routing
-}
-```
+See [datasource/types.go](datasource/types.go).
 
 ### Selection Algorithms
 
@@ -126,84 +71,54 @@ type RouteConfig struct {
 
 ### Request Coalescing (Singleflight)
 
-Concurrent requests for the same key are coalesced into a single data source call:
-
-```go
-result, err, _ := d.sfGroup.Do(key, func() (interface{}, error) {
-    return d.dataSource.Get(ctx, key)
-})
-```
+Concurrent requests for the same key are coalesced into a single data source call (see data source implementations under `datasource/`).
 
 ### Negative Caching
 
-Cache "key not found" results to avoid repeated lookups:
+Cache "key not found" results to avoid repeated lookups (see `datasource/cache/cache.go`).
 
-```go
-if cache.IsNegativeCached(key) {
-    return nil, nil  // Skip data source call
-}
-```
+Cache implementation details: see [datasource/cache/cache.go](datasource/cache/cache.go).
+
+### Initial Load Timeout
+
+Each data source performs an initial load during `Provision`. The initial load is bound to the module
+lifecycle context, and is additionally capped by an optional per-source `initial_load_timeout`.
+This prevents slow backends from blocking startup indefinitely while still allowing background
+watchers/pollers to retry.
 
 ### Lock-Free Algorithms
 
-Weighted round-robin uses atomic operations instead of mutex:
+Some algorithms use atomic operations instead of mutexes (see `matcher/selector.go`).
 
-```go
-index := atomic.AddUint64(&s.counter, 1)
-return upstreams[index % total]
-```
+Selector implementation: see [matcher/selector.go](matcher/selector.go).
 
 ### Upstream Pool Indexing
 
 O(1) upstream lookup using pre-built index:
 
-```go
-upstreamIndex := make(map[string]*reverseproxy.Upstream)
-// Build once during Provision, use for every request
-```
+This is implemented in the selection policy; see `plugin.go`.
 
 ## Caddy Module Registration
 
-```go
-func init() {
-    caddy.RegisterModule(&DynamicSelection{})
-}
+Each module registers itself in its package init; see `plugin.go` and each `datasource/*/*.go`.
 
-func (*DynamicSelection) CaddyModule() caddy.ModuleInfo {
-    return caddy.ModuleInfo{
-        ID:  "http.reverse_proxy.selection_policies.dynamic",
-        New: func() caddy.Module { return new(DynamicSelection) },
-    }
-}
-```
+Entry module: see [plugin.go](plugin.go).
 
 ### Registered Modules
 
-```
-http.reverse_proxy.selection_policies.dynamic
-http.reverse_proxy.selection_policies.dynamic.sources.etcd
-http.reverse_proxy.selection_policies.dynamic.sources.redis
-http.reverse_proxy.selection_policies.dynamic.sources.consul
-http.reverse_proxy.selection_policies.dynamic.sources.file
-http.reverse_proxy.selection_policies.dynamic.sources.http
-http.reverse_proxy.selection_policies.dynamic.sources.composite
-http.reverse_proxy.selection_policies.dynamic.sources.zookeeper
-http.reverse_proxy.selection_policies.dynamic.sources.sql
-http.reverse_proxy.selection_policies.dynamic.sources.kubernetes
-http.reverse_proxy.upstreams.dynamic
-```
+Module IDs are defined in code; see `plugin.go`, `dynamic_upstreams.go`, and the individual data source packages under `datasource/`.
+
+Related files:
+- [plugin.go](plugin.go)
+- [dynamic_upstreams.go](dynamic_upstreams.go)
 
 ## Event System
 
 Publish-subscribe pattern for routing events:
 
-```go
-bus := GetEventBus()
-bus.Subscribe(EventRouteSelected, func(name string, data interface{}) {
-    event := data.(RouteSelectedEvent)
-    // Handle event
-})
-```
+See `events.go`.
+
+Event bus and types: see [events.go](events.go).
 
 Events:
 - `dynamic_lb.route_selected`
@@ -216,37 +131,34 @@ Events:
 
 ### Prometheus Metrics
 
-```go
-var RouteHits = promauto.NewCounterVec(
-    prometheus.CounterOpts{
-        Namespace: "caddy",
-        Subsystem: "dynamic_lb",
-        Name:      "route_hits_total",
-    },
-    []string{"key", "upstream"},
-)
-```
+See `metrics/metrics.go` and the metrics reference in `examples/metrics/README.md`.
+
+References:
+- [metrics/metrics.go](metrics/metrics.go)
+- [examples/metrics/README.md](examples/metrics/README.md)
+
+Additional low-cardinality metrics are provided for alerting and operational safety, including:
+
+- `caddy_dynamic_lb_route_config_parse_errors_total{source_type}`: counts route-config parse failures per data source type.
 
 ### OpenTelemetry Tracing
 
-```go
-ctx, span := tracer.Start(ctx, "dynamic_lb.route_selection")
-defer span.End()
-span.SetAttributes(
-    attribute.String("routing_key", key),
-    attribute.String("upstream", upstream),
-)
-```
+See `tracing/` and `examples/tracing/README.md`.
+
+References:
+- [tracing/](tracing/)
+- [examples/tracing/README.md](examples/tracing/README.md)
 
 ### Admin API
 
 - `GET /dynamic-lb/stats` - Routing statistics
 - `GET /dynamic-lb/health` - Health check
 - `GET /dynamic-lb/routes` - Cached routes
-- `DELETE /dynamic-lb/cache?key=X` - Invalidate cache
+- `GET /dynamic-lb/policies` - Registered dynamic selection policy instances
+- `GET /dynamic-lb/cache` - Cache statistics (aggregated + per data source instance)
+- `DELETE /dynamic-lb/cache` - Clear caches for all registered data source instances
 
 ## Known Limitations
 
 1. **least_conn** uses local counter, not shared across instances
 2. **Composite** data source requires JSON configuration (not Caddyfile)
-3. **Admin API routes** returns empty list (cache integration pending)

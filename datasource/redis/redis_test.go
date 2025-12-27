@@ -24,24 +24,31 @@ func TestRedisSourceIntegration(t *testing.T) {
 	client := redis.NewClient(&redis.Options{
 		Addr: addr,
 	})
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Clean up test keys
 	testPrefix := "caddy:test:routing:"
-	keys, _ := client.Keys(ctx, testPrefix+"*").Result()
+	keys, err := client.Keys(ctx, testPrefix+"*").Result()
+	if err != nil {
+		t.Fatalf("Failed to list keys: %v", err)
+	}
 	if len(keys) > 0 {
-		client.Del(ctx, keys...)
+		if err := client.Del(ctx, keys...).Err(); err != nil {
+			t.Fatalf("Failed to delete keys: %v", err)
+		}
 	}
 	defer func() {
 		keys, _ := client.Keys(ctx, testPrefix+"*").Result()
 		if len(keys) > 0 {
-			client.Del(ctx, keys...)
+			_ = client.Del(ctx, keys...).Err()
 		}
 	}()
 
 	// Set up test data
-	client.Set(ctx, testPrefix+"tenant-a", "backend-a:8080", 0)
-	client.Set(ctx, testPrefix+"tenant-b", `{
+	if err := client.Set(ctx, testPrefix+"tenant-a", "backend-a:8080", 0).Err(); err != nil {
+		t.Fatalf("Failed to set tenant-a: %v", err)
+	}
+	if err := client.Set(ctx, testPrefix+"tenant-b", `{
 		"rules": [
 			{
 				"match": {"http.request.header.X-Version": "v2"},
@@ -50,7 +57,9 @@ func TestRedisSourceIntegration(t *testing.T) {
 			}
 		],
 		"fallback": "random"
-	}`, 0)
+	}`, 0).Err(); err != nil {
+		t.Fatalf("Failed to set tenant-b: %v", err)
+	}
 
 	// Create and provision the data source
 	source := &RedisSource{
@@ -66,7 +75,7 @@ func TestRedisSourceIntegration(t *testing.T) {
 	if err := source.Provision(caddyCtx); err != nil {
 		t.Fatalf("Provision failed: %v", err)
 	}
-	defer source.Cleanup()
+	defer func() { _ = source.Cleanup() }()
 
 	// Wait for initial load
 	time.Sleep(100 * time.Millisecond)

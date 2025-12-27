@@ -18,6 +18,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/puxu-msft/caddy-dynamic-routing/datasource"
+	"github.com/puxu-msft/caddy-dynamic-routing/metrics"
 )
 
 func init() {
@@ -51,6 +52,12 @@ type FileSource struct {
 	cancelWatch context.CancelFunc
 	watchWg     sync.WaitGroup
 	isDir       bool
+
+	// Admin / diagnostics
+	adminName string
+	lastError atomic.Value // string
+	hits      atomic.Uint64
+	misses    atomic.Uint64
 }
 
 // CaddyModule returns the Caddy module information.
@@ -88,9 +95,11 @@ func (f *FileSource) Provision(ctx caddy.Context) error {
 	// Initial load
 	if err := f.loadAll(); err != nil {
 		f.logger.Warn("initial file load failed", zap.Error(err))
+		f.lastError.Store(err.Error())
 		f.healthy.Store(false)
 	} else {
 		f.healthy.Store(true)
+		f.lastError.Store("")
 	}
 
 	// Start watcher if enabled
@@ -107,11 +116,17 @@ func (f *FileSource) Provision(ctx caddy.Context) error {
 		zap.Bool("watch", *f.Watch),
 	)
 
+	// Register for Admin API inspection
+	f.adminName = datasource.RegisterAdminSource(f)
+
 	return nil
 }
 
 // Cleanup releases resources.
 func (f *FileSource) Cleanup() error {
+	datasource.UnregisterAdminSource(f.adminName)
+	f.adminName = ""
+
 	if f.cancelWatch != nil {
 		f.cancelWatch()
 	}
@@ -122,9 +137,75 @@ func (f *FileSource) Cleanup() error {
 // Get retrieves the route configuration for the given key.
 func (f *FileSource) Get(ctx context.Context, key string) (*datasource.RouteConfig, error) {
 	if cached, ok := f.cache.Load(key); ok {
+		f.hits.Add(1)
 		return cached.(*datasource.RouteConfig), nil
 	}
+	f.misses.Add(1)
 	return nil, nil
+}
+
+// AdminType returns the short type name for Admin API.
+func (*FileSource) AdminType() string { return "file" }
+
+// AdminLastError returns the most recent error message (best-effort).
+func (f *FileSource) AdminLastError() string {
+	if v := f.lastError.Load(); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// AdminListRoutes returns a snapshot of in-memory cached routes.
+func (f *FileSource) AdminListRoutes() []datasource.AdminRouteInfo {
+	routes := make([]datasource.AdminRouteInfo, 0)
+	f.cache.Range(func(k, v any) bool {
+		key, ok := k.(string)
+		if !ok {
+			return true
+		}
+		cfg, ok := v.(*datasource.RouteConfig)
+		if !ok {
+			return true
+		}
+		routes = append(routes, datasource.SummarizeRouteConfig(key, cfg))
+		return true
+	})
+	return routes
+}
+
+// AdminCacheStats returns a snapshot of in-memory cache stats.
+func (f *FileSource) AdminCacheStats() datasource.AdminCacheStats {
+	entries := 0
+	f.cache.Range(func(_, _ any) bool {
+		entries++
+		return true
+	})
+	h := f.hits.Load()
+	m := f.misses.Load()
+	total := h + m
+	hr := 0.0
+	if total > 0 {
+		hr = float64(h) / float64(total)
+	}
+	return datasource.AdminCacheStats{
+		Entries: entries,
+		MaxSize: 0,
+		Hits:    h,
+		Misses:  m,
+		HitRate: hr,
+	}
+}
+
+// AdminClearCache clears all in-memory state.
+func (f *FileSource) AdminClearCache() {
+	f.cache.Range(func(k, _ any) bool {
+		f.cache.Delete(k)
+		return true
+	})
+	f.hits.Store(0)
+	f.misses.Store(0)
 }
 
 // Healthy returns true if the file source is healthy.
@@ -173,6 +254,7 @@ func (f *FileSource) loadDirectory() error {
 
 		config, err := datasource.ParseRouteConfig(data)
 		if err != nil {
+			metrics.RecordRouteConfigParseError(f.AdminType())
 			f.logger.Warn("failed to parse config", zap.String("file", filePath), zap.Error(err))
 			continue
 		}
@@ -219,6 +301,7 @@ func (f *FileSource) loadSingleFile() error {
 	for key, raw := range routes {
 		config, err := datasource.ParseRouteConfig(raw)
 		if err != nil {
+			metrics.RecordRouteConfigParseError(f.AdminType())
 			f.logger.Warn("failed to parse config", zap.String("key", key), zap.Error(err))
 			continue
 		}
@@ -256,7 +339,11 @@ func (f *FileSource) watchLoop(ctx context.Context) {
 		f.pollLoop(ctx)
 		return
 	}
-	defer watcher.Close()
+	defer func() {
+		if err := watcher.Close(); err != nil {
+			f.logger.Debug("failed to close fsnotify watcher", zap.Error(err))
+		}
+	}()
 
 	// Add path to watcher
 	if err := watcher.Add(f.Path); err != nil {

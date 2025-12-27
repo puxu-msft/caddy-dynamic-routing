@@ -3,6 +3,7 @@ package cache
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru"
@@ -16,17 +17,17 @@ const DefaultMaxSize = 10000
 // DefaultNegativeTTL is the default TTL for negative cache entries.
 const DefaultNegativeTTL = 30 * time.Second
 
-// negativeEntry represents a cached "not found" result.
-type negativeEntry struct {
-	expiresAt time.Time
-}
-
 // RouteCache is a thread-safe LRU cache for route configurations.
 // Note: hashicorp/golang-lru.Cache is already thread-safe, so no external locking is needed.
 type RouteCache struct {
 	cache       *lru.Cache
 	maxSize     int
 	negativeTTL time.Duration
+
+	// Stats
+	hits         atomic.Uint64
+	misses       atomic.Uint64
+	negativeHits atomic.Uint64
 
 	// Negative cache for missing keys (separate from main cache to avoid type issues)
 	negativeCache sync.Map // map[string]time.Time (expiration time)
@@ -53,6 +54,8 @@ func (c *RouteCache) Get(key string) *datasource.RouteConfig {
 	// Check negative cache first
 	if exp, ok := c.negativeCache.Load(key); ok {
 		if time.Now().Before(exp.(time.Time)) {
+			c.negativeHits.Add(1)
+			c.hits.Add(1)
 			return nil // Still valid negative entry
 		}
 		// Expired, remove it
@@ -60,8 +63,10 @@ func (c *RouteCache) Get(key string) *datasource.RouteConfig {
 	}
 
 	if val, ok := c.cache.Get(key); ok {
+		c.hits.Add(1)
 		return val.(*datasource.RouteConfig)
 	}
+	c.misses.Add(1)
 	return nil
 }
 
@@ -104,11 +109,37 @@ func (c *RouteCache) Delete(key string) {
 // Clear removes all entries from the cache.
 func (c *RouteCache) Clear() {
 	c.cache.Purge()
+	// Clear negative cache
+	c.negativeCache.Range(func(k, _ any) bool {
+		c.negativeCache.Delete(k)
+		return true
+	})
+	// Reset stats
+	c.hits.Store(0)
+	c.misses.Store(0)
+	c.negativeHits.Store(0)
 }
 
 // Len returns the number of entries in the cache.
 func (c *RouteCache) Len() int {
 	return c.cache.Len()
+}
+
+// MaxSize returns the configured max size for the cache.
+func (c *RouteCache) MaxSize() int {
+	return c.maxSize
+}
+
+// Stats returns a snapshot of cache hit/miss counters.
+func (c *RouteCache) Stats() (hits, misses, negativeHits uint64, hitRate float64) {
+	h := c.hits.Load()
+	m := c.misses.Load()
+	nh := c.negativeHits.Load()
+	total := h + m
+	if total == 0 {
+		return h, m, nh, 0
+	}
+	return h, m, nh, float64(h) / float64(total)
 }
 
 // Keys returns all keys in the cache.

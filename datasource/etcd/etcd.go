@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 
 	"github.com/puxu-msft/caddy-dynamic-routing/datasource"
 	"github.com/puxu-msft/caddy-dynamic-routing/datasource/cache"
+	"github.com/puxu-msft/caddy-dynamic-routing/metrics"
 )
 
 func init() {
@@ -47,6 +49,11 @@ type EtcdSource struct {
 	// Default: 2s
 	RequestTimeout caddy.Duration `json:"request_timeout,omitempty"`
 
+	// InitialLoadTimeout is the maximum time allowed for the initial load during
+	// Provision.
+	// Default: DialTimeout
+	InitialLoadTimeout caddy.Duration `json:"initial_load_timeout,omitempty"`
+
 	// MaxCacheSize is the maximum number of entries in the cache.
 	// Default: 10000
 	MaxCacheSize int `json:"max_cache_size,omitempty"`
@@ -65,6 +72,10 @@ type EtcdSource struct {
 	logger      *zap.Logger
 	cancelWatch context.CancelFunc
 	sfGroup     singleflight.Group // Coalesce concurrent requests for same key
+
+	// Admin / diagnostics
+	adminName string
+	lastError atomic.Value // string
 }
 
 // CaddyModule returns the Caddy module information.
@@ -118,15 +129,23 @@ func (e *EtcdSource) Provision(ctx caddy.Context) error {
 	}
 
 	// Initial health check and data load
-	if err := e.initialLoad(ctx); err != nil {
+	loadCtx := ctx.Context
+	if e.InitialLoadTimeout != 0 {
+		c, cancel := context.WithTimeout(ctx.Context, time.Duration(e.InitialLoadTimeout))
+		defer cancel()
+		loadCtx = c
+	}
+	if err := e.initialLoad(loadCtx); err != nil {
 		e.logger.Warn("initial etcd load failed, will retry", zap.Error(err))
+		e.lastError.Store(err.Error())
 		e.healthy.Store(false)
 	} else {
 		e.healthy.Store(true)
+		e.lastError.Store("")
 	}
 
 	// Start watcher
-	watchCtx, cancel := context.WithCancel(context.Background())
+	watchCtx, cancel := context.WithCancel(ctx.Context)
 	e.cancelWatch = cancel
 	go e.watchLoop(watchCtx)
 
@@ -136,11 +155,17 @@ func (e *EtcdSource) Provision(ctx caddy.Context) error {
 		zap.Int("max_cache_size", e.MaxCacheSize),
 	)
 
+	// Register for Admin API inspection
+	e.adminName = datasource.RegisterAdminSource(e)
+
 	return nil
 }
 
 // Cleanup releases resources.
 func (e *EtcdSource) Cleanup() error {
+	datasource.UnregisterAdminSource(e.adminName)
+	e.adminName = ""
+
 	if e.cancelWatch != nil {
 		e.cancelWatch()
 	}
@@ -180,6 +205,7 @@ func (e *EtcdSource) Get(ctx context.Context, key string) (*datasource.RouteConf
 		resp, err := e.client.Get(reqCtx, fullKey)
 		if err != nil {
 			e.logger.Warn("etcd get failed", zap.String("key", fullKey), zap.Error(err))
+			e.lastError.Store(err.Error())
 			return nil, err
 		}
 
@@ -192,7 +218,9 @@ func (e *EtcdSource) Get(ctx context.Context, key string) (*datasource.RouteConf
 		// Parse and cache the config
 		config, err := datasource.ParseRouteConfig(resp.Kvs[0].Value)
 		if err != nil {
+			metrics.RecordRouteConfigParseError(e.AdminType())
 			e.logger.Error("failed to parse route config", zap.String("key", fullKey), zap.Error(err))
+			e.lastError.Store(err.Error())
 			return nil, err
 		}
 
@@ -206,10 +234,65 @@ func (e *EtcdSource) Get(ctx context.Context, key string) (*datasource.RouteConf
 	if err != nil {
 		return nil, err
 	}
+	e.lastError.Store("")
 	if result == nil {
 		return nil, nil
 	}
 	return result.(*datasource.RouteConfig), nil
+}
+
+// AdminType returns the short type name for Admin API.
+func (*EtcdSource) AdminType() string { return "etcd" }
+
+// AdminLastError returns the most recent error message (best-effort).
+func (e *EtcdSource) AdminLastError() string {
+	if v := e.lastError.Load(); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// AdminListRoutes returns a snapshot of cached routes.
+func (e *EtcdSource) AdminListRoutes() []datasource.AdminRouteInfo {
+	if e.cache == nil {
+		return nil
+	}
+
+	routes := make([]datasource.AdminRouteInfo, 0, e.cache.Len())
+	e.cache.Range(func(k string, cfg *datasource.RouteConfig) bool {
+		key := k
+		if e.Prefix != "" {
+			key = strings.TrimPrefix(key, e.Prefix)
+		}
+		routes = append(routes, datasource.SummarizeRouteConfig(key, cfg))
+		return true
+	})
+	return routes
+}
+
+// AdminCacheStats returns a snapshot of internal cache stats.
+func (e *EtcdSource) AdminCacheStats() datasource.AdminCacheStats {
+	if e.cache == nil {
+		return datasource.AdminCacheStats{}
+	}
+	h, m, nh, hr := e.cache.Stats()
+	return datasource.AdminCacheStats{
+		Entries:      e.cache.Len(),
+		MaxSize:      e.cache.MaxSize(),
+		Hits:         h,
+		Misses:       m,
+		NegativeHits: nh,
+		HitRate:      hr,
+	}
+}
+
+// AdminClearCache clears all internal caches.
+func (e *EtcdSource) AdminClearCache() {
+	if e.cache != nil {
+		e.cache.Clear()
+	}
 }
 
 // Healthy returns true if the etcd connection is healthy.
@@ -218,8 +301,12 @@ func (e *EtcdSource) Healthy() bool {
 }
 
 // initialLoad loads all existing routing configurations from etcd.
-func (e *EtcdSource) initialLoad(ctx caddy.Context) error {
-	reqCtx, cancel := context.WithTimeout(context.Background(), time.Duration(e.DialTimeout))
+func (e *EtcdSource) initialLoad(ctx context.Context) error {
+	timeout := time.Duration(e.DialTimeout)
+	if e.InitialLoadTimeout != 0 {
+		timeout = time.Duration(e.InitialLoadTimeout)
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	resp, err := e.client.Get(reqCtx, e.Prefix, clientv3.WithPrefix())
@@ -230,6 +317,7 @@ func (e *EtcdSource) initialLoad(ctx caddy.Context) error {
 	for _, kv := range resp.Kvs {
 		config, err := datasource.ParseRouteConfig(kv.Value)
 		if err != nil {
+			metrics.RecordRouteConfigParseError(e.AdminType())
 			e.logger.Warn("failed to parse config during initial load",
 				zap.String("key", string(kv.Key)),
 				zap.Error(err),
@@ -309,6 +397,7 @@ func (e *EtcdSource) watch(ctx context.Context) error {
 				case clientv3.EventTypePut:
 					config, err := datasource.ParseRouteConfig(ev.Kv.Value)
 					if err != nil {
+						metrics.RecordRouteConfigParseError(e.AdminType())
 						e.logger.Warn("failed to parse updated config",
 							zap.String("key", key),
 							zap.Error(err),
@@ -406,6 +495,16 @@ func (e *EtcdSource) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid request_timeout: %v", err)
 				}
 				e.RequestTimeout = caddy.Duration(dur)
+
+			case "initial_load_timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("invalid initial_load_timeout: %v", err)
+				}
+				e.InitialLoadTimeout = caddy.Duration(dur)
 
 			case "tls":
 				e.TLSEnabled = true

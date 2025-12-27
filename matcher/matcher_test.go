@@ -1,6 +1,8 @@
 package matcher
 
 import (
+	"context"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -58,7 +60,7 @@ func TestRuleMatcher_Match_RulesMode(t *testing.T) {
 				Priority: 10,
 			},
 			{
-				Match:    map[string]string{}, // Default rule
+				Match: map[string]string{}, // Default rule
 				Upstreams: []datasource.WeightedUpstream{
 					{Address: "backend-default:8080", Weight: 1},
 				},
@@ -98,7 +100,6 @@ func TestRuleMatcher_Match_RulesMode(t *testing.T) {
 
 func TestRuleMatcher_MatchConditions(t *testing.T) {
 	m := NewRuleMatcher()
-	req := httptest.NewRequest("GET", "/test", nil)
 
 	tests := []struct {
 		name       string
@@ -145,7 +146,7 @@ func TestRuleMatcher_MatchConditions(t *testing.T) {
 				repl.Set(k, v)
 			}
 
-			result := m.matchConditions(req, repl, tt.conditions)
+			result := m.matchConditions(nil, repl, tt.conditions)
 			if result != tt.expected {
 				t.Errorf("matchConditions() = %v, want %v", result, tt.expected)
 			}
@@ -205,6 +206,35 @@ func TestRuleMatcher_RegexCache(t *testing.T) {
 	}
 }
 
+func TestRuleMatcher_CachesAreBounded(t *testing.T) {
+	m := NewRuleMatcherWithCacheSizes(2, 2)
+
+	// Populate regex cache beyond capacity.
+	for _, pattern := range []string{"a", "b", "c", "d"} {
+		if _, err := m.getRegex(pattern); err != nil {
+			t.Fatalf("getRegex(%q) returned error: %v", pattern, err)
+		}
+	}
+	if m.regexCache == nil {
+		t.Fatalf("expected regexCache to be initialized")
+	}
+	if got := m.regexCache.Len(); got > 2 {
+		t.Fatalf("expected regexCache Len <= 2, got %d", got)
+	}
+
+	// Populate selector cache beyond capacity.
+	_ = m.getSelector(string(AlgorithmWeightedRandom), "k1")
+	_ = m.getSelector(string(AlgorithmWeightedRandom), "k2")
+	_ = m.getSelector(string(AlgorithmWeightedRandom), "k3")
+	_ = m.getSelector(string(AlgorithmWeightedRandom), "k4")
+	if m.selectorCache == nil {
+		t.Fatalf("expected selectorCache to be initialized")
+	}
+	if got := m.selectorCache.Len(); got > 2 {
+		t.Fatalf("expected selectorCache Len <= 2, got %d", got)
+	}
+}
+
 func TestRuleMatcher_SelectUpstream(t *testing.T) {
 	m := NewRuleMatcher()
 	req := httptest.NewRequest("GET", "/test", nil)
@@ -253,19 +283,30 @@ func TestRuleMatcher_SelectUpstream(t *testing.T) {
 
 func TestRuleMatcher_ResolvePlaceholder(t *testing.T) {
 	m := NewRuleMatcher()
-	req := httptest.NewRequest("GET", "/test", nil)
 
 	t.Run("nil replacer", func(t *testing.T) {
-		result := m.resolvePlaceholder(req, nil, "http.request.header.X-Test")
+		result := m.resolvePlaceholder(nil, nil, "http.request.header.X-Test")
 		if result != "" {
 			t.Errorf("Expected empty for nil replacer, got %q", result)
+		}
+	})
+
+	t.Run("request fallback when replacer is nil", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com/path", nil)
+		if err != nil {
+			t.Fatalf("http.NewRequestWithContext: %v", err)
+		}
+		req.Header.Set("X-Test", "value")
+		result := m.resolvePlaceholder(req, nil, "{http.request.header.X-Test}")
+		if result != "value" {
+			t.Errorf("Expected 'value', got %q", result)
 		}
 	})
 
 	t.Run("with curly braces", func(t *testing.T) {
 		repl := caddy.NewReplacer()
 		repl.Set("http.request.header.X-Test", "value")
-		result := m.resolvePlaceholder(req, repl, "{http.request.header.X-Test}")
+		result := m.resolvePlaceholder(nil, repl, "{http.request.header.X-Test}")
 		if result != "value" {
 			t.Errorf("Expected 'value', got %q", result)
 		}
@@ -274,7 +315,7 @@ func TestRuleMatcher_ResolvePlaceholder(t *testing.T) {
 	t.Run("without curly braces", func(t *testing.T) {
 		repl := caddy.NewReplacer()
 		repl.Set("http.request.header.X-Test", "value")
-		result := m.resolvePlaceholder(req, repl, "http.request.header.X-Test")
+		result := m.resolvePlaceholder(nil, repl, "http.request.header.X-Test")
 		if result != "value" {
 			t.Errorf("Expected 'value', got %q", result)
 		}
@@ -285,7 +326,6 @@ func TestRuleMatcher_ResolvePlaceholder(t *testing.T) {
 // that processes exact matches before regex patterns for fast-fail.
 func TestRuleMatcher_MatchConditions_MixedExactAndRegex(t *testing.T) {
 	m := NewRuleMatcher()
-	req := httptest.NewRequest("GET", "/test", nil)
 
 	tests := []struct {
 		name       string
@@ -364,7 +404,7 @@ func TestRuleMatcher_MatchConditions_MixedExactAndRegex(t *testing.T) {
 				repl.Set(k, v)
 			}
 
-			result := m.matchConditions(req, repl, tt.conditions)
+			result := m.matchConditions(nil, repl, tt.conditions)
 			if result != tt.expected {
 				t.Errorf("matchConditions() = %v, want %v", result, tt.expected)
 			}

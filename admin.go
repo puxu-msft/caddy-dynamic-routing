@@ -7,7 +7,9 @@ import (
 	"sync"
 
 	"github.com/caddyserver/caddy/v2"
+	lru "github.com/hashicorp/golang-lru"
 
+	"github.com/puxu-msft/caddy-dynamic-routing/datasource"
 	"github.com/puxu-msft/caddy-dynamic-routing/metrics"
 )
 
@@ -42,6 +44,10 @@ func (a AdminAPI) Routes() []caddy.AdminRoute {
 			Handler: caddy.AdminHandlerFunc(a.handleRoutes),
 		},
 		{
+			Pattern: "/dynamic-lb/policies",
+			Handler: caddy.AdminHandlerFunc(a.handlePolicies),
+		},
+		{
 			Pattern: "/dynamic-lb/cache",
 			Handler: caddy.AdminHandlerFunc(a.handleCache),
 		},
@@ -50,25 +56,26 @@ func (a AdminAPI) Routes() []caddy.AdminRoute {
 
 // StatsResponse contains statistics about the dynamic load balancer.
 type StatsResponse struct {
-	RouteHits   map[string]int64 `json:"route_hits,omitempty"`
-	RouteMisses map[string]int64 `json:"route_misses,omitempty"`
-	CacheHits   int64            `json:"cache_hits"`
-	CacheMisses int64            `json:"cache_misses"`
-	CacheHitRate float64         `json:"cache_hit_rate"`
+	RouteHits    map[string]int64 `json:"route_hits,omitempty"`
+	RouteMisses  map[string]int64 `json:"route_misses,omitempty"`
+	CacheHits    uint64           `json:"cache_hits"`
+	CacheMisses  uint64           `json:"cache_misses"`
+	CacheHitRate float64          `json:"cache_hit_rate"`
 }
 
 // HealthResponse contains health information about data sources.
 type HealthResponse struct {
-	DataSources map[string]DataSourceHealthInfo `json:"data_sources"`
-	Overall     string                          `json:"overall"`
+	DataSources map[string]DataSourceHealthInfo              `json:"data_sources"`
+	Overall     string                                       `json:"overall"`
+	ParseErrors map[string]metrics.RouteConfigParseErrorInfo `json:"route_config_parse_errors,omitempty"`
 }
 
 // DataSourceHealthInfo contains health info for a single data source.
 type DataSourceHealthInfo struct {
-	Healthy      bool   `json:"healthy"`
-	Type         string `json:"type"`
-	ConfigCount  int    `json:"config_count"`
-	LastError    string `json:"last_error,omitempty"`
+	Healthy     bool   `json:"healthy"`
+	Type        string `json:"type"`
+	ConfigCount int    `json:"config_count"`
+	LastError   string `json:"last_error,omitempty"`
 }
 
 // RoutesResponse contains route configuration information.
@@ -79,17 +86,30 @@ type RoutesResponse struct {
 
 // RouteInfo contains information about a single route.
 type RouteInfo struct {
-	Key       string   `json:"key"`
-	Upstream  string   `json:"upstream,omitempty"`
-	Upstreams []string `json:"upstreams,omitempty"`
-	RuleCount int      `json:"rule_count"`
+	Source     string   `json:"source,omitempty"`
+	SourceType string   `json:"source_type,omitempty"`
+	Key        string   `json:"key"`
+	Upstream   string   `json:"upstream,omitempty"`
+	Upstreams  []string `json:"upstreams,omitempty"`
+	RuleCount  int      `json:"rule_count"`
 }
 
 // CacheResponse contains cache statistics.
 type CacheResponse struct {
-	Entries  int     `json:"entries"`
-	HitRate  float64 `json:"hit_rate"`
-	MaxSize  int     `json:"max_size"`
+	Entries      int                                          `json:"entries"`
+	HitRate      float64                                      `json:"hit_rate"`
+	MaxSize      int                                          `json:"max_size"`
+	Hits         uint64                                       `json:"hits"`
+	Misses       uint64                                       `json:"misses"`
+	NegativeHits uint64                                       `json:"negative_hits"`
+	Sources      map[string]datasource.AdminCacheStats        `json:"sources,omitempty"`
+	ParseErrors  map[string]metrics.RouteConfigParseErrorInfo `json:"route_config_parse_errors,omitempty"`
+}
+
+// PoliciesResponse contains registered dynamic selection policy instances.
+type PoliciesResponse struct {
+	Policies []SelectionPolicyInfo `json:"policies"`
+	Total    int                   `json:"total"`
 }
 
 // handleStats returns statistics about route hits/misses.
@@ -101,15 +121,29 @@ func (a *AdminAPI) handleStats(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 
-	// Get stats from registry
+	// Route hit/miss stats (recorded by the selection policy)
 	stats := routeStatsRegistry.GetStats()
+
+	// Cache stats aggregated across registered data sources
+	entries := datasource.ListAdminEntries()
+	cacheHits, cacheMisses := uint64(0), uint64(0)
+	for _, e := range entries {
+		cs := e.DS.AdminCacheStats()
+		cacheHits += cs.Hits
+		cacheMisses += cs.Misses
+	}
+	cacheTotal := cacheHits + cacheMisses
+	cacheHitRate := 0.0
+	if cacheTotal > 0 {
+		cacheHitRate = float64(cacheHits) / float64(cacheTotal)
+	}
 
 	response := StatsResponse{
 		RouteHits:    stats.Hits,
 		RouteMisses:  stats.Misses,
-		CacheHits:    stats.CacheHits,
-		CacheMisses:  stats.CacheMisses,
-		CacheHitRate: stats.CacheHitRate(),
+		CacheHits:    cacheHits,
+		CacheMisses:  cacheMisses,
+		CacheHitRate: cacheHitRate,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -125,21 +159,25 @@ func (a *AdminAPI) handleHealth(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 
-	// Get health info from registry
-	healthInfo := dataSourceRegistry.GetHealthInfo()
-
+	entries := datasource.ListAdminEntries()
+	info := make(map[string]DataSourceHealthInfo, len(entries))
 	overall := "healthy"
-	for _, info := range healthInfo {
-		if !info.Healthy {
+	for _, e := range entries {
+		routes := e.DS.AdminListRoutes()
+		healthy := e.DS.Healthy()
+		lastErr := e.DS.AdminLastError()
+		info[e.Name] = DataSourceHealthInfo{
+			Healthy:     healthy,
+			Type:        e.Type,
+			ConfigCount: len(routes),
+			LastError:   lastErr,
+		}
+		if !healthy {
 			overall = "degraded"
-			break
 		}
 	}
 
-	response := HealthResponse{
-		DataSources: healthInfo,
-		Overall:     overall,
-	}
+	response := HealthResponse{DataSources: info, Overall: overall, ParseErrors: metrics.RouteConfigParseErrorSnapshot()}
 
 	w.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(response)
@@ -154,13 +192,22 @@ func (a *AdminAPI) handleRoutes(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 
-	// Get routes from registry
-	routes := dataSourceRegistry.GetRoutes()
-
-	response := RoutesResponse{
-		Routes: routes,
-		Total:  len(routes),
+	entries := datasource.ListAdminEntries()
+	routes := make([]RouteInfo, 0)
+	for _, e := range entries {
+		for _, ri := range e.DS.AdminListRoutes() {
+			routes = append(routes, RouteInfo{
+				Source:     e.Name,
+				SourceType: e.Type,
+				Key:        ri.Key,
+				Upstream:   ri.Upstream,
+				Upstreams:  ri.Upstreams,
+				RuleCount:  ri.RuleCount,
+			})
+		}
 	}
+
+	response := RoutesResponse{Routes: routes, Total: len(routes)}
 
 	w.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(response)
@@ -181,88 +228,125 @@ func (a *AdminAPI) handleCache(w http.ResponseWriter, r *http.Request) error {
 	}
 }
 
+// handlePolicies lists registered dynamic selection policy instances.
+func (a *AdminAPI) handlePolicies(w http.ResponseWriter, r *http.Request) error {
+	if r.Method != http.MethodGet {
+		return caddy.APIError{HTTPStatus: http.StatusMethodNotAllowed, Err: nil}
+	}
+
+	policies := listSelectionPolicies()
+	response := PoliciesResponse{Policies: policies, Total: len(policies)}
+
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(response)
+}
+
 func (a *AdminAPI) getCacheStats(w http.ResponseWriter, _ *http.Request) error {
-	stats := dataSourceRegistry.GetCacheStats()
+	entries := datasource.ListAdminEntries()
+	perSource := make(map[string]datasource.AdminCacheStats, len(entries))
+
+	totalEntries := 0
+	totalMax := 0
+	hits := uint64(0)
+	misses := uint64(0)
+	negativeHits := uint64(0)
+	for _, e := range entries {
+		cs := e.DS.AdminCacheStats()
+		perSource[e.Name] = cs
+		totalEntries += cs.Entries
+		totalMax += cs.MaxSize
+		hits += cs.Hits
+		misses += cs.Misses
+		negativeHits += cs.NegativeHits
+	}
+
+	hitRate := 0.0
+	if hits+misses > 0 {
+		hitRate = float64(hits) / float64(hits+misses)
+	}
+
+	stats := CacheResponse{
+		Entries:      totalEntries,
+		MaxSize:      totalMax,
+		Hits:         hits,
+		Misses:       misses,
+		NegativeHits: negativeHits,
+		HitRate:      hitRate,
+		Sources:      perSource,
+		ParseErrors:  metrics.RouteConfigParseErrorSnapshot(),
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(stats)
 }
 
 func (a *AdminAPI) clearCache(w http.ResponseWriter, _ *http.Request) error {
-	dataSourceRegistry.ClearCache()
+	entries := datasource.ListAdminEntries()
+	cleared := 0
+	for _, e := range entries {
+		e.DS.AdminClearCache()
+		cleared++
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	return json.NewEncoder(w).Encode(map[string]string{
-		"status": "cache cleared",
+	return json.NewEncoder(w).Encode(map[string]any{
+		"status":          "cache cleared",
+		"cleared_sources": cleared,
 	})
 }
 
 // RouteStats holds route hit/miss statistics.
 type RouteStats struct {
-	Hits        map[string]int64
-	Misses      map[string]int64
-	CacheHits   int64
-	CacheMisses int64
-}
-
-// CacheHitRate calculates the cache hit rate.
-func (s *RouteStats) CacheHitRate() float64 {
-	total := s.CacheHits + s.CacheMisses
-	if total == 0 {
-		return 0.0
-	}
-	return float64(s.CacheHits) / float64(total)
+	Hits   map[string]int64
+	Misses map[string]int64
 }
 
 // RouteStatsRegistry is a thread-safe registry for route statistics.
 type RouteStatsRegistry struct {
-	mu          sync.RWMutex
-	hits        map[string]int64
-	misses      map[string]int64
-	cacheHits   int64
-	cacheMisses int64
+	mu     sync.RWMutex
+	hits   *lru.Cache
+	misses *lru.Cache
 }
+
+const defaultRouteStatsMaxKeys = 1000
 
 // NewRouteStatsRegistry creates a new RouteStatsRegistry.
 func NewRouteStatsRegistry() *RouteStatsRegistry {
+	hits, _ := lru.New(defaultRouteStatsMaxKeys)
+	misses, _ := lru.New(defaultRouteStatsMaxKeys)
 	return &RouteStatsRegistry{
-		hits:   make(map[string]int64),
-		misses: make(map[string]int64),
+		hits:   hits,
+		misses: misses,
 	}
 }
 
 // RecordHit records a route hit.
-func (r *RouteStatsRegistry) RecordHit(key string) {
+func (r *RouteStatsRegistry) RecordHit(key string, _ string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.hits[key]++
-
-	// Also record to Prometheus
-	metrics.RecordRouteHit(key, "")
+	if key == "" {
+		return
+	}
+	if v, ok := r.hits.Get(key); ok {
+		r.hits.Add(key, v.(int64)+1)
+		return
+	}
+	r.hits.Add(key, int64(1))
 }
 
 // RecordMiss records a route miss.
 func (r *RouteStatsRegistry) RecordMiss(key string, reason string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.misses[key]++
-
-	// Also record to Prometheus
-	metrics.RecordRouteMiss(key, metrics.MissReason(reason))
-}
-
-// RecordCacheHit records a cache hit.
-func (r *RouteStatsRegistry) RecordCacheHit() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.cacheHits++
-}
-
-// RecordCacheMiss records a cache miss.
-func (r *RouteStatsRegistry) RecordCacheMiss() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.cacheMisses++
+	_ = reason
+	if key == "" {
+		return
+	}
+	if v, ok := r.misses.Get(key); ok {
+		r.misses.Add(key, v.(int64)+1)
+		return
+	}
+	r.misses.Add(key, int64(1))
 }
 
 // GetStats returns a copy of the current statistics.
@@ -270,117 +354,37 @@ func (r *RouteStatsRegistry) GetStats() RouteStats {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	hits := make(map[string]int64, len(r.hits))
-	for k, v := range r.hits {
-		hits[k] = v
+	hits := make(map[string]int64, r.hits.Len())
+	for _, k := range r.hits.Keys() {
+		key, ok := k.(string)
+		if !ok {
+			continue
+		}
+		if v, ok := r.hits.Peek(key); ok {
+			hits[key] = v.(int64)
+		}
 	}
 
-	misses := make(map[string]int64, len(r.misses))
-	for k, v := range r.misses {
-		misses[k] = v
+	misses := make(map[string]int64, r.misses.Len())
+	for _, k := range r.misses.Keys() {
+		key, ok := k.(string)
+		if !ok {
+			continue
+		}
+		if v, ok := r.misses.Peek(key); ok {
+			misses[key] = v.(int64)
+		}
 	}
 
 	return RouteStats{
-		Hits:        hits,
-		Misses:      misses,
-		CacheHits:   r.cacheHits,
-		CacheMisses: r.cacheMisses,
+		Hits:   hits,
+		Misses: misses,
 	}
-}
-
-// DataSourceRegistry tracks registered data sources.
-type DataSourceRegistry struct {
-	mu          sync.RWMutex
-	dataSources map[string]DataSourceEntry
-}
-
-// DataSourceEntry holds information about a registered data source.
-type DataSourceEntry struct {
-	Source    interface{}
-	Type      string
-	Healthy   bool
-	LastError string
-}
-
-// NewDataSourceRegistry creates a new DataSourceRegistry.
-func NewDataSourceRegistry() *DataSourceRegistry {
-	return &DataSourceRegistry{
-		dataSources: make(map[string]DataSourceEntry),
-	}
-}
-
-// Register registers a data source.
-func (d *DataSourceRegistry) Register(name string, source interface{}, sourceType string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.dataSources[name] = DataSourceEntry{
-		Source:  source,
-		Type:    sourceType,
-		Healthy: true,
-	}
-}
-
-// Unregister removes a data source.
-func (d *DataSourceRegistry) Unregister(name string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	delete(d.dataSources, name)
-}
-
-// UpdateHealth updates the health status of a data source.
-func (d *DataSourceRegistry) UpdateHealth(name string, healthy bool, lastError string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if entry, ok := d.dataSources[name]; ok {
-		entry.Healthy = healthy
-		entry.LastError = lastError
-		d.dataSources[name] = entry
-	}
-}
-
-// GetHealthInfo returns health information for all data sources.
-func (d *DataSourceRegistry) GetHealthInfo() map[string]DataSourceHealthInfo {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	result := make(map[string]DataSourceHealthInfo, len(d.dataSources))
-	for name, entry := range d.dataSources {
-		result[name] = DataSourceHealthInfo{
-			Healthy:   entry.Healthy,
-			Type:      entry.Type,
-			LastError: entry.LastError,
-		}
-	}
-	return result
-}
-
-// GetRoutes returns route information from all data sources.
-func (d *DataSourceRegistry) GetRoutes() []RouteInfo {
-	// This is a simplified implementation
-	// In a real implementation, this would iterate over cached routes
-	return []RouteInfo{}
-}
-
-// GetCacheStats returns cache statistics.
-func (d *DataSourceRegistry) GetCacheStats() CacheResponse {
-	// This is a simplified implementation
-	return CacheResponse{
-		Entries: 0,
-		HitRate: 0.0,
-		MaxSize: 0,
-	}
-}
-
-// ClearCache clears all caches.
-func (d *DataSourceRegistry) ClearCache() {
-	// This is a simplified implementation
-	// In a real implementation, this would clear caches in all data sources
 }
 
 // Global registries
 var (
-	routeStatsRegistry   = NewRouteStatsRegistry()
-	dataSourceRegistry   = NewDataSourceRegistry()
+	routeStatsRegistry = NewRouteStatsRegistry()
 )
 
 // Interface guards

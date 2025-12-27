@@ -4,6 +4,7 @@ package consul
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/puxu-msft/caddy-dynamic-routing/datasource"
 	"github.com/puxu-msft/caddy-dynamic-routing/datasource/cache"
+	"github.com/puxu-msft/caddy-dynamic-routing/metrics"
 )
 
 func init() {
@@ -60,6 +62,11 @@ type ConsulSource struct {
 	// Default: 10000
 	MaxCacheSize int `json:"max_cache_size,omitempty"`
 
+	// InitialLoadTimeout is the maximum time allowed for the initial load during
+	// Provision.
+	// Default: 30s
+	InitialLoadTimeout caddy.Duration `json:"initial_load_timeout,omitempty"`
+
 	// Internal state
 	client      *api.Client
 	cache       *cache.RouteCache
@@ -69,6 +76,10 @@ type ConsulSource struct {
 	watchWg     sync.WaitGroup
 	lastIndex   atomic.Uint64
 	sfGroup     singleflight.Group // Coalesce concurrent requests for same key
+
+	// Admin / diagnostics
+	adminName string
+	lastError atomic.Value // string
 }
 
 // CaddyModule returns the Caddy module information.
@@ -128,15 +139,23 @@ func (c *ConsulSource) Provision(ctx caddy.Context) error {
 	}
 
 	// Initial health check and data load
-	if err := c.initialLoad(ctx); err != nil {
+	loadTimeout := time.Duration(c.InitialLoadTimeout)
+	if loadTimeout == 0 {
+		loadTimeout = datasource.DefaultInitialLoadTimeout
+	}
+	loadCtx, cancel := context.WithTimeout(ctx.Context, loadTimeout)
+	defer cancel()
+	if err := c.initialLoad(loadCtx); err != nil {
 		c.logger.Warn("initial Consul load failed, will retry", zap.Error(err))
+		c.lastError.Store(err.Error())
 		c.healthy.Store(false)
 	} else {
 		c.healthy.Store(true)
+		c.lastError.Store("")
 	}
 
 	// Start watcher
-	watchCtx, cancel := context.WithCancel(context.Background())
+	watchCtx, cancel := context.WithCancel(ctx.Context)
 	c.cancelWatch = cancel
 	c.watchWg.Add(1)
 	go c.watchLoop(watchCtx)
@@ -146,11 +165,17 @@ func (c *ConsulSource) Provision(ctx caddy.Context) error {
 		zap.String("prefix", c.Prefix),
 	)
 
+	// Register for Admin API inspection
+	c.adminName = datasource.RegisterAdminSource(c)
+
 	return nil
 }
 
 // Cleanup releases resources.
 func (c *ConsulSource) Cleanup() error {
+	datasource.UnregisterAdminSource(c.adminName)
+	c.adminName = ""
+
 	if c.cancelWatch != nil {
 		c.cancelWatch()
 	}
@@ -190,6 +215,7 @@ func (c *ConsulSource) Get(ctx context.Context, key string) (*datasource.RouteCo
 		pair, _, err := kv.Get(fullKey, nil)
 		if err != nil {
 			c.logger.Warn("Consul get failed", zap.String("key", fullKey), zap.Error(err))
+			c.lastError.Store(err.Error())
 			return nil, err
 		}
 
@@ -202,7 +228,9 @@ func (c *ConsulSource) Get(ctx context.Context, key string) (*datasource.RouteCo
 		// Parse and cache the config
 		config, err := datasource.ParseRouteConfig(pair.Value)
 		if err != nil {
+			metrics.RecordRouteConfigParseError(c.AdminType())
 			c.logger.Error("failed to parse route config", zap.String("key", fullKey), zap.Error(err))
+			c.lastError.Store(err.Error())
 			return nil, err
 		}
 
@@ -216,10 +244,61 @@ func (c *ConsulSource) Get(ctx context.Context, key string) (*datasource.RouteCo
 	if err != nil {
 		return nil, err
 	}
+	c.lastError.Store("")
 	if result == nil {
 		return nil, nil
 	}
 	return result.(*datasource.RouteConfig), nil
+}
+
+// AdminType returns the short type name for Admin API.
+func (*ConsulSource) AdminType() string { return "consul" }
+
+// AdminLastError returns the most recent error message (best-effort).
+func (c *ConsulSource) AdminLastError() string {
+	if v := c.lastError.Load(); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// AdminListRoutes returns a snapshot of cached routes.
+func (c *ConsulSource) AdminListRoutes() []datasource.AdminRouteInfo {
+	if c.cache == nil {
+		return nil
+	}
+	routes := make([]datasource.AdminRouteInfo, 0, c.cache.Len())
+	c.cache.Range(func(k string, cfg *datasource.RouteConfig) bool {
+		key := strings.TrimPrefix(k, c.Prefix)
+		routes = append(routes, datasource.SummarizeRouteConfig(key, cfg))
+		return true
+	})
+	return routes
+}
+
+// AdminCacheStats returns a snapshot of internal cache stats.
+func (c *ConsulSource) AdminCacheStats() datasource.AdminCacheStats {
+	if c.cache == nil {
+		return datasource.AdminCacheStats{}
+	}
+	h, m, nh, hr := c.cache.Stats()
+	return datasource.AdminCacheStats{
+		Entries:      c.cache.Len(),
+		MaxSize:      c.cache.MaxSize(),
+		Hits:         h,
+		Misses:       m,
+		NegativeHits: nh,
+		HitRate:      hr,
+	}
+}
+
+// AdminClearCache clears all internal caches.
+func (c *ConsulSource) AdminClearCache() {
+	if c.cache != nil {
+		c.cache.Clear()
+	}
 }
 
 // Healthy returns true if the Consul connection is healthy.
@@ -228,11 +307,12 @@ func (c *ConsulSource) Healthy() bool {
 }
 
 // initialLoad loads all existing routing configurations from Consul.
-func (c *ConsulSource) initialLoad(ctx caddy.Context) error {
+func (c *ConsulSource) initialLoad(ctx context.Context) error {
 	kv := c.client.KV()
 
 	// List all keys with prefix
-	pairs, meta, err := kv.List(c.Prefix, nil)
+	q := (&api.QueryOptions{}).WithContext(ctx)
+	pairs, meta, err := kv.List(c.Prefix, q)
 	if err != nil {
 		return fmt.Errorf("initial load failed: %v", err)
 	}
@@ -242,6 +322,7 @@ func (c *ConsulSource) initialLoad(ctx caddy.Context) error {
 	for _, pair := range pairs {
 		config, err := datasource.ParseRouteConfig(pair.Value)
 		if err != nil {
+			metrics.RecordRouteConfigParseError(c.AdminType())
 			c.logger.Warn("failed to parse config during initial load",
 				zap.String("key", pair.Key),
 				zap.Error(err),
@@ -332,6 +413,7 @@ func (c *ConsulSource) watch(ctx context.Context) error {
 			newKeys[pair.Key] = true
 			config, err := datasource.ParseRouteConfig(pair.Value)
 			if err != nil {
+				metrics.RecordRouteConfigParseError(c.AdminType())
 				c.logger.Warn("failed to parse updated config",
 					zap.String("key", pair.Key),
 					zap.Error(err),
@@ -360,6 +442,12 @@ func (c *ConsulSource) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		for nesting := d.Nesting(); d.NextBlock(nesting); {
 			switch d.Val() {
 			case "address":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				c.Address = d.Val()
+
+			case "addr":
 				if !d.NextArg() {
 					return d.ArgErr()
 				}
@@ -404,6 +492,16 @@ func (c *ConsulSource) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid wait_time: %v", err)
 				}
 				c.WaitTime = caddy.Duration(dur)
+
+			case "initial_load_timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("invalid initial_load_timeout: %v", err)
+				}
+				c.InitialLoadTimeout = caddy.Duration(dur)
 
 			case "tls":
 				c.TLSEnabled = true

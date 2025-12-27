@@ -2,7 +2,10 @@
 package metrics
 
 import (
+	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -13,6 +16,52 @@ const (
 	namespace = "caddy"
 	subsystem = "dynamic_lb"
 )
+
+// RouteMetricsCardinality controls whether route hit/miss metrics include
+// high-cardinality labels (routing key / upstream).
+//
+// Detailed mode is useful for debugging but can create an unbounded number of
+// time series in multi-tenant or high-key environments.
+type RouteMetricsCardinality string
+
+const (
+	// RouteMetricsCardinalityDetailed includes routing key/upstream labels.
+	RouteMetricsCardinalityDetailed RouteMetricsCardinality = "detailed"
+	// RouteMetricsCardinalityCoarse collapses routing key/upstream labels to a constant.
+	RouteMetricsCardinalityCoarse RouteMetricsCardinality = "coarse"
+)
+
+const coarseLabelValue = "__all__"
+
+var routeMetricsCardinality atomic.Int32
+
+func init() {
+	// Preserve backwards-compatible behavior: detailed metrics unless explicitly configured.
+	routeMetricsCardinality.Store(int32(0))
+}
+
+// SetRouteMetricsCardinalityFromString configures route hit/miss metric cardinality.
+// Allowed values: "detailed" (default) or "coarse".
+func SetRouteMetricsCardinalityFromString(mode string) error {
+	switch RouteMetricsCardinality(strings.ToLower(strings.TrimSpace(mode))) {
+	case "", RouteMetricsCardinalityDetailed:
+		routeMetricsCardinality.Store(int32(0))
+		return nil
+	case RouteMetricsCardinalityCoarse:
+		routeMetricsCardinality.Store(int32(1))
+		return nil
+	default:
+		return fmt.Errorf("invalid metrics cardinality %q (allowed: %q, %q)", mode, RouteMetricsCardinalityDetailed, RouteMetricsCardinalityCoarse)
+	}
+}
+
+// RouteMetricsCardinalityMode returns the currently configured cardinality mode.
+func RouteMetricsCardinalityMode() RouteMetricsCardinality {
+	if routeMetricsCardinality.Load() == int32(1) {
+		return RouteMetricsCardinalityCoarse
+	}
+	return RouteMetricsCardinalityDetailed
+}
 
 var (
 	// RouteHits tracks total number of route hits by key and upstream.
@@ -35,6 +84,17 @@ var (
 			Help:      "Total number of route misses by key and reason",
 		},
 		[]string{"key", "reason"},
+	)
+
+	// RouteConfigParseErrors tracks the number of route-config parse errors by source type.
+	RouteConfigParseErrors = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      "route_config_parse_errors_total",
+			Help:      "Total number of route configuration parse errors by source type",
+		},
+		[]string{"source_type"},
 	)
 
 	// DataSourceLatency tracks data source lookup latency.
@@ -195,9 +255,20 @@ var (
 	)
 )
 
+// RouteConfigParseErrorInfo is a low-cardinality in-process summary of route-config parse errors.
+// It is intended for Admin API debugging when Prometheus is not available.
+type RouteConfigParseErrorInfo struct {
+	Total  uint64    `json:"total"`
+	LastAt time.Time `json:"last_at,omitempty"`
+}
+
+var routeConfigParseErrorMu sync.Mutex
+var routeConfigParseErrorInfoBySourceType = make(map[string]RouteConfigParseErrorInfo)
+
 // MissReason represents the reason for a route miss.
 type MissReason string
 
+// MissReason constants enumerate the possible reasons for a route miss.
 const (
 	MissReasonNoKey          MissReason = "no_key"
 	MissReasonNoConfig       MissReason = "no_config"
@@ -205,6 +276,8 @@ const (
 	MissReasonNotInPool      MissReason = "not_in_pool"
 	MissReasonUnhealthy      MissReason = "unhealthy"
 	MissReasonError          MissReason = "error"
+	MissReasonDisabled       MissReason = "disabled"
+	MissReasonExpired        MissReason = "expired"
 	MissReasonNoReplacer     MissReason = "no_replacer"
 	MissReasonNoDataSource   MissReason = "no_datasource"
 	MissReasonNoKeyExtractor MissReason = "no_key_extractor"
@@ -227,12 +300,48 @@ func (t *Timer) ObserveDuration(observer prometheus.Observer) {
 
 // RecordRouteHit records a successful route hit.
 func RecordRouteHit(key, upstream string) {
+	if RouteMetricsCardinalityMode() == RouteMetricsCardinalityCoarse {
+		RouteHits.WithLabelValues(coarseLabelValue, coarseLabelValue).Inc()
+		return
+	}
 	RouteHits.WithLabelValues(key, upstream).Inc()
 }
 
 // RecordRouteMiss records a route miss with reason.
 func RecordRouteMiss(key string, reason MissReason) {
+	if RouteMetricsCardinalityMode() == RouteMetricsCardinalityCoarse {
+		RouteMisses.WithLabelValues(coarseLabelValue, string(reason)).Inc()
+		return
+	}
 	RouteMisses.WithLabelValues(key, string(reason)).Inc()
+}
+
+// RecordRouteConfigParseError records a route-config parse error for a given data source type.
+func RecordRouteConfigParseError(sourceType string) {
+	if sourceType == "" {
+		sourceType = "unknown"
+	}
+	RouteConfigParseErrors.WithLabelValues(sourceType).Inc()
+
+	now := time.Now()
+	routeConfigParseErrorMu.Lock()
+	info := routeConfigParseErrorInfoBySourceType[sourceType]
+	info.Total++
+	info.LastAt = now
+	routeConfigParseErrorInfoBySourceType[sourceType] = info
+	routeConfigParseErrorMu.Unlock()
+}
+
+// RouteConfigParseErrorSnapshot returns a best-effort snapshot of parse error totals by source type.
+func RouteConfigParseErrorSnapshot() map[string]RouteConfigParseErrorInfo {
+	routeConfigParseErrorMu.Lock()
+	defer routeConfigParseErrorMu.Unlock()
+
+	out := make(map[string]RouteConfigParseErrorInfo, len(routeConfigParseErrorInfoBySourceType))
+	for k, v := range routeConfigParseErrorInfoBySourceType {
+		out[k] = v
+	}
+	return out
 }
 
 // RecordCacheHit records a cache hit.

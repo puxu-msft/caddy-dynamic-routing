@@ -33,12 +33,16 @@ func TestConsulSourceIntegration(t *testing.T) {
 	testPrefix := "caddy/test/routing/"
 
 	// Clean up test keys
-	kv.DeleteTree(testPrefix, nil)
-	defer kv.DeleteTree(testPrefix, nil)
+	if _, err := kv.DeleteTree(testPrefix, nil); err != nil {
+		t.Fatalf("Failed to delete test prefix: %v", err)
+	}
+	defer func() { _, _ = kv.DeleteTree(testPrefix, nil) }()
 
 	// Set up test data
-	kv.Put(&api.KVPair{Key: testPrefix + "tenant-a", Value: []byte("backend-a:8080")}, nil)
-	kv.Put(&api.KVPair{Key: testPrefix + "tenant-b", Value: []byte(`{
+	if _, err := kv.Put(&api.KVPair{Key: testPrefix + "tenant-a", Value: []byte("backend-a:8080")}, nil); err != nil {
+		t.Fatalf("Failed to put tenant-a: %v", err)
+	}
+	if _, err := kv.Put(&api.KVPair{Key: testPrefix + "tenant-b", Value: []byte(`{
 		"rules": [
 			{
 				"match": {"http.request.header.X-Version": "v2"},
@@ -47,7 +51,9 @@ func TestConsulSourceIntegration(t *testing.T) {
 			}
 		],
 		"fallback": "random"
-	}`)}, nil)
+	}`)}, nil); err != nil {
+		t.Fatalf("Failed to put tenant-b: %v", err)
+	}
 
 	// Create and provision the data source
 	source := &ConsulSource{
@@ -62,7 +68,7 @@ func TestConsulSourceIntegration(t *testing.T) {
 	if err := source.Provision(caddyCtx); err != nil {
 		t.Fatalf("Provision failed: %v", err)
 	}
-	defer source.Cleanup()
+	defer func() { _ = source.Cleanup() }()
 
 	// Wait for initial load
 	time.Sleep(100 * time.Millisecond)

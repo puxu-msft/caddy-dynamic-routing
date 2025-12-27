@@ -22,6 +22,7 @@ import (
 
 	"github.com/puxu-msft/caddy-dynamic-routing/datasource"
 	"github.com/puxu-msft/caddy-dynamic-routing/datasource/cache"
+	"github.com/puxu-msft/caddy-dynamic-routing/metrics"
 )
 
 func init() {
@@ -50,11 +51,18 @@ type KubernetesSource struct {
 	// Default is 10000.
 	MaxCacheSize int `json:"max_cache_size,omitempty"`
 
+	// InitialLoadTimeout is the maximum time allowed for the initial load during
+	// Provision.
+	// Default: 30s
+	InitialLoadTimeout caddy.Duration `json:"initial_load_timeout,omitempty"`
+
 	// internal fields
 	client    kubernetes.Interface
 	cache     *cache.RouteCache
 	healthy   atomic.Bool
 	logger    *zap.Logger
+	adminName string
+	lastError atomic.Value // string
 	ctx       context.Context
 	cancel    context.CancelFunc
 	watcherWg sync.WaitGroup
@@ -88,7 +96,7 @@ func (k *KubernetesSource) Provision(ctx caddy.Context) error {
 	k.cache = cache.NewRouteCache(k.MaxCacheSize)
 
 	// Create context for watchers
-	k.ctx, k.cancel = context.WithCancel(context.Background())
+	k.ctx, k.cancel = context.WithCancel(ctx.Context)
 
 	// Create Kubernetes client
 	var config *rest.Config
@@ -114,11 +122,19 @@ func (k *KubernetesSource) Provision(ctx caddy.Context) error {
 	}
 
 	// Initial load
-	if err := k.initialLoad(); err != nil {
+	loadTimeout := time.Duration(k.InitialLoadTimeout)
+	if loadTimeout == 0 {
+		loadTimeout = datasource.DefaultInitialLoadTimeout
+	}
+	loadCtx, cancel := context.WithTimeout(k.ctx, loadTimeout)
+	defer cancel()
+	if err := k.initialLoad(loadCtx); err != nil {
 		k.logger.Warn("initial kubernetes load failed", zap.Error(err))
+		k.lastError.Store(err.Error())
 		k.healthy.Store(false)
 	} else {
 		k.healthy.Store(true)
+		k.lastError.Store("")
 	}
 
 	// Start watcher
@@ -129,11 +145,17 @@ func (k *KubernetesSource) Provision(ctx caddy.Context) error {
 		zap.String("namespace", k.Namespace),
 		zap.String("configmap", k.ConfigMapName))
 
+	// Register for Admin API inspection
+	k.adminName = datasource.RegisterAdminSource(k)
+
 	return nil
 }
 
 // Cleanup releases Kubernetes resources.
 func (k *KubernetesSource) Cleanup() error {
+	datasource.UnregisterAdminSource(k.adminName)
+	k.adminName = ""
+
 	if k.cancel != nil {
 		k.cancel()
 	}
@@ -171,6 +193,7 @@ func (k *KubernetesSource) Get(ctx context.Context, key string) (*datasource.Rou
 		cm, err := k.client.CoreV1().ConfigMaps(k.Namespace).Get(ctx, k.ConfigMapName, metav1.GetOptions{})
 		if err != nil {
 			k.healthy.Store(false)
+			k.lastError.Store(err.Error())
 			return nil, fmt.Errorf("failed to get configmap: %w", err)
 		}
 
@@ -183,9 +206,11 @@ func (k *KubernetesSource) Get(ctx context.Context, key string) (*datasource.Rou
 
 		config, err := datasource.ParseRouteConfig([]byte(data))
 		if err != nil {
+			metrics.RecordRouteConfigParseError(k.AdminType())
 			k.logger.Warn("failed to parse route config",
 				zap.String("key", key),
 				zap.Error(err))
+			k.lastError.Store(err.Error())
 			return nil, nil
 		}
 
@@ -197,10 +222,60 @@ func (k *KubernetesSource) Get(ctx context.Context, key string) (*datasource.Rou
 	if err != nil {
 		return nil, err
 	}
+	k.lastError.Store("")
 	if result == nil {
 		return nil, nil
 	}
 	return result.(*datasource.RouteConfig), nil
+}
+
+// AdminType returns the short type name for Admin API.
+func (*KubernetesSource) AdminType() string { return "kubernetes" }
+
+// AdminLastError returns the most recent error message (best-effort).
+func (k *KubernetesSource) AdminLastError() string {
+	if v := k.lastError.Load(); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// AdminListRoutes returns a snapshot of cached routes.
+func (k *KubernetesSource) AdminListRoutes() []datasource.AdminRouteInfo {
+	if k.cache == nil {
+		return nil
+	}
+	routes := make([]datasource.AdminRouteInfo, 0, k.cache.Len())
+	k.cache.Range(func(key string, cfg *datasource.RouteConfig) bool {
+		routes = append(routes, datasource.SummarizeRouteConfig(key, cfg))
+		return true
+	})
+	return routes
+}
+
+// AdminCacheStats returns a snapshot of internal cache stats.
+func (k *KubernetesSource) AdminCacheStats() datasource.AdminCacheStats {
+	if k.cache == nil {
+		return datasource.AdminCacheStats{}
+	}
+	h, m, nh, hr := k.cache.Stats()
+	return datasource.AdminCacheStats{
+		Entries:      k.cache.Len(),
+		MaxSize:      k.cache.MaxSize(),
+		Hits:         h,
+		Misses:       m,
+		NegativeHits: nh,
+		HitRate:      hr,
+	}
+}
+
+// AdminClearCache clears all internal caches.
+func (k *KubernetesSource) AdminClearCache() {
+	if k.cache != nil {
+		k.cache.Clear()
+	}
 }
 
 // Healthy returns the health status of the Kubernetes connection.
@@ -209,16 +284,16 @@ func (k *KubernetesSource) Healthy() bool {
 }
 
 // initialLoad loads all existing configurations from ConfigMap.
-func (k *KubernetesSource) initialLoad() error {
+func (k *KubernetesSource) initialLoad(ctx context.Context) error {
 	if k.LabelSelector != "" {
-		return k.loadByLabelSelector()
+		return k.loadByLabelSelector(ctx)
 	}
-	return k.loadByConfigMapName()
+	return k.loadByConfigMapName(ctx)
 }
 
 // loadByConfigMapName loads a specific ConfigMap.
-func (k *KubernetesSource) loadByConfigMapName() error {
-	cm, err := k.client.CoreV1().ConfigMaps(k.Namespace).Get(k.ctx, k.ConfigMapName, metav1.GetOptions{})
+func (k *KubernetesSource) loadByConfigMapName(ctx context.Context) error {
+	cm, err := k.client.CoreV1().ConfigMaps(k.Namespace).Get(ctx, k.ConfigMapName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to get configmap %s: %w", k.ConfigMapName, err)
 	}
@@ -227,8 +302,8 @@ func (k *KubernetesSource) loadByConfigMapName() error {
 }
 
 // loadByLabelSelector loads ConfigMaps matching the label selector.
-func (k *KubernetesSource) loadByLabelSelector() error {
-	cmList, err := k.client.CoreV1().ConfigMaps(k.Namespace).List(k.ctx, metav1.ListOptions{
+func (k *KubernetesSource) loadByLabelSelector(ctx context.Context) error {
+	cmList, err := k.client.CoreV1().ConfigMaps(k.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: k.LabelSelector,
 	})
 	if err != nil {
@@ -252,6 +327,7 @@ func (k *KubernetesSource) loadConfigMapData(cm *corev1.ConfigMap) error {
 	for key, data := range cm.Data {
 		config, err := datasource.ParseRouteConfig([]byte(data))
 		if err != nil {
+			metrics.RecordRouteConfigParseError(k.AdminType())
 			k.logger.Warn("failed to parse config",
 				zap.String("configmap", cm.Name),
 				zap.String("key", key),
@@ -350,6 +426,7 @@ func (k *KubernetesSource) handleConfigMapUpdate(cm *corev1.ConfigMap) {
 	for key, data := range cm.Data {
 		config, err := datasource.ParseRouteConfig([]byte(data))
 		if err != nil {
+			metrics.RecordRouteConfigParseError(k.AdminType())
 			k.logger.Warn("failed to parse config",
 				zap.String("configmap", cm.Name),
 				zap.String("key", key),
@@ -413,6 +490,15 @@ func (k *KubernetesSource) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid max_cache_size: %v", err)
 				}
 				k.MaxCacheSize = size
+			case "initial_load_timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("invalid initial_load_timeout: %v", err)
+				}
+				k.InitialLoadTimeout = caddy.Duration(dur)
 			default:
 				return d.Errf("unrecognized subdirective: %s", d.Val())
 			}

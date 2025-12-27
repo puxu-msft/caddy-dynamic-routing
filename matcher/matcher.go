@@ -8,28 +8,54 @@ import (
 	"sync"
 
 	"github.com/caddyserver/caddy/v2"
+	lru "github.com/hashicorp/golang-lru"
 
 	"github.com/puxu-msft/caddy-dynamic-routing/datasource"
+)
+
+const (
+	defaultRegexCacheSize    = 1024
+	defaultSelectorCacheSize = 1024
 )
 
 // RuleMatcher matches routing rules against HTTP requests.
 type RuleMatcher struct {
 	// regexCache caches compiled regular expressions to avoid repeated compilation.
-	regexCache sync.Map // map[string]*regexp.Regexp
+	regexCache *lru.Cache // map[string]*regexp.Regexp
 
 	// selectorCache caches UpstreamSelectors per algorithm+key combination.
-	selectorCache sync.Map // map[string]*UpstreamSelector
+	selectorCache *lru.Cache // map[string]*UpstreamSelector
 }
 
 // NewRuleMatcher creates a new RuleMatcher.
 func NewRuleMatcher() *RuleMatcher {
-	return &RuleMatcher{}
+	return NewRuleMatcherWithCacheSizes(defaultRegexCacheSize, defaultSelectorCacheSize)
+}
+
+// NewRuleMatcherWithCacheSizes creates a new RuleMatcher with bounded caches.
+// If a size is <= 0, a default size is used.
+func NewRuleMatcherWithCacheSizes(regexCacheSize, selectorCacheSize int) *RuleMatcher {
+	if regexCacheSize <= 0 {
+		regexCacheSize = defaultRegexCacheSize
+	}
+	if selectorCacheSize <= 0 {
+		selectorCacheSize = defaultSelectorCacheSize
+	}
+
+	regexCache, _ := lru.New(regexCacheSize)
+	selectorCache, _ := lru.New(selectorCacheSize)
+	return &RuleMatcher{
+		regexCache:    regexCache,
+		selectorCache: selectorCache,
+	}
 }
 
 // getRegex retrieves a compiled regex from cache or compiles and caches it.
 func (m *RuleMatcher) getRegex(pattern string) (*regexp.Regexp, error) {
-	if cached, ok := m.regexCache.Load(pattern); ok {
-		return cached.(*regexp.Regexp), nil
+	if m.regexCache != nil {
+		if cached, ok := m.regexCache.Get(pattern); ok {
+			return cached.(*regexp.Regexp), nil
+		}
 	}
 
 	re, err := regexp.Compile(pattern)
@@ -38,7 +64,9 @@ func (m *RuleMatcher) getRegex(pattern string) (*regexp.Regexp, error) {
 	}
 
 	// Store in cache (may race with another goroutine, but that's ok)
-	m.regexCache.Store(pattern, re)
+	if m.regexCache != nil {
+		m.regexCache.Add(pattern, re)
+	}
 	return re, nil
 }
 
@@ -61,12 +89,16 @@ func (m *RuleMatcher) getSelector(algorithm, algorithmKey string) *UpstreamSelec
 	cacheKey := sb.String()
 	selectorCacheKeyBuilder.Put(sb)
 
-	if cached, ok := m.selectorCache.Load(cacheKey); ok {
-		return cached.(*UpstreamSelector)
+	if m.selectorCache != nil {
+		if cached, ok := m.selectorCache.Get(cacheKey); ok {
+			return cached.(*UpstreamSelector)
+		}
 	}
 
 	selector := NewUpstreamSelector(SelectionAlgorithm(algorithm), algorithmKey)
-	m.selectorCache.Store(cacheKey, selector)
+	if m.selectorCache != nil {
+		m.selectorCache.Add(cacheKey, selector)
+	}
 	return selector
 }
 
@@ -174,17 +206,41 @@ func (m *RuleMatcher) matchRegex(actual, expected string) bool {
 }
 
 // resolvePlaceholder resolves a placeholder path to its value.
+// It primarily uses Caddy's replacer, but can fall back to the HTTP request
+// for a small set of common placeholders to preserve flexibility.
 func (m *RuleMatcher) resolvePlaceholder(r *http.Request, repl *caddy.Replacer, placeholder string) string {
-	if repl == nil {
-		return ""
-	}
-
 	// Handle both with and without curly braces
 	key := strings.Trim(placeholder, "{}")
 
 	// Try to get from replacer
-	if val, ok := repl.GetString(key); ok {
-		return val
+	if repl != nil {
+		if val, ok := repl.GetString(key); ok {
+			return val
+		}
+	}
+
+	if r == nil {
+		return ""
+	}
+
+	// Minimal request fallback for common placeholders.
+	switch key {
+	case "http.request.method":
+		return r.Method
+	case "http.request.host":
+		return r.Host
+	case "http.request.uri.path":
+		if r.URL != nil {
+			return r.URL.Path
+		}
+		return ""
+	}
+	if strings.HasPrefix(key, "http.request.header.") {
+		h := strings.TrimPrefix(key, "http.request.header.")
+		if h == "" {
+			return ""
+		}
+		return r.Header.Get(h)
 	}
 
 	return ""

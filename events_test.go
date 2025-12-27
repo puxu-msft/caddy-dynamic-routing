@@ -124,8 +124,23 @@ func TestRouteSelectedEvent_Fields(t *testing.T) {
 	if event.Key != "test-key" {
 		t.Errorf("Key mismatch")
 	}
+	if event.Upstream != "backend:8080" {
+		t.Errorf("Upstream mismatch")
+	}
+	if event.Algorithm != "round_robin" {
+		t.Errorf("Algorithm mismatch")
+	}
 	if event.Duration != 100*time.Millisecond {
 		t.Errorf("Duration mismatch")
+	}
+	if event.ConfigVersion != 5 {
+		t.Errorf("ConfigVersion mismatch")
+	}
+	if event.RequestPath != "/api/v1/users" {
+		t.Errorf("RequestPath mismatch")
+	}
+	if event.RequestMethod != "GET" {
+		t.Errorf("RequestMethod mismatch")
 	}
 }
 
@@ -138,8 +153,20 @@ func TestRouteMissedEvent_Fields(t *testing.T) {
 		RequestMethod: "POST",
 	}
 
+	if event.Key != "test-key" {
+		t.Errorf("Key mismatch")
+	}
 	if event.Reason != "no_config" {
 		t.Errorf("Reason mismatch")
+	}
+	if event.FallbackUsed != "random" {
+		t.Errorf("FallbackUsed mismatch")
+	}
+	if event.RequestPath != "/api/v1/users" {
+		t.Errorf("RequestPath mismatch")
+	}
+	if event.RequestMethod != "POST" {
+		t.Errorf("RequestMethod mismatch")
 	}
 }
 
@@ -153,22 +180,41 @@ func TestConfigUpdatedEvent_Fields(t *testing.T) {
 		Timestamp:  now,
 	}
 
+	if event.Key != "tenant-a" {
+		t.Errorf("Key mismatch")
+	}
+	if event.SourceType != "etcd" {
+		t.Errorf("SourceType mismatch")
+	}
 	if event.OldVersion != 1 || event.NewVersion != 2 {
 		t.Errorf("Version mismatch")
+	}
+	if !event.Timestamp.Equal(now) {
+		t.Errorf("Timestamp mismatch")
 	}
 }
 
 func TestDataSourceHealthChangedEvent_Fields(t *testing.T) {
+	now := time.Now()
 	event := DataSourceHealthChangedEvent{
 		SourceType:      "redis",
 		Healthy:         false,
 		PreviousHealthy: true,
 		Error:           "connection refused",
-		Timestamp:       time.Now(),
+		Timestamp:       now,
 	}
 
+	if event.SourceType != "redis" {
+		t.Errorf("SourceType mismatch")
+	}
 	if event.Healthy != false || event.PreviousHealthy != true {
 		t.Errorf("Health status mismatch")
+	}
+	if event.Error != "connection refused" {
+		t.Errorf("Error mismatch")
+	}
+	if !event.Timestamp.Equal(now) {
+		t.Errorf("Timestamp mismatch")
 	}
 }
 
@@ -224,17 +270,17 @@ func TestEventBus_ConcurrentSubscribePublish(t *testing.T) {
 		wg.Add(2)
 
 		// Subscriber goroutine
-		go func(id int) {
+		go func() {
 			defer wg.Done()
 			for j := 0; j < numOperations; j++ {
 				bus.Subscribe(EventConfigUpdated, func(eventName string, data interface{}) {
 					// Do nothing, just testing concurrency safety
 				})
 			}
-		}(i)
+		}()
 
 		// Publisher goroutine
-		go func(id int) {
+		go func() {
 			defer wg.Done()
 			for j := 0; j < numOperations; j++ {
 				bus.Publish(EventConfigUpdated, ConfigUpdatedEvent{
@@ -242,7 +288,7 @@ func TestEventBus_ConcurrentSubscribePublish(t *testing.T) {
 					SourceType: "etcd",
 				})
 			}
-		}(i)
+		}()
 	}
 
 	wg.Wait()

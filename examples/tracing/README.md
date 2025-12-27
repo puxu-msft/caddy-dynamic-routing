@@ -2,6 +2,14 @@
 
 Integrate with OpenTelemetry for distributed tracing.
 
+Navigation:
+
+- Back to examples index: [../README.md](../README.md)
+- Related: [../metrics/README.md](../metrics/README.md)
+- Related: [../admin-api/README.md](../admin-api/README.md)
+
+Note: this repository includes tracing helper APIs under the `tracing` package, but the core routing path does not automatically create spans unless you explicitly integrate the tracer/middleware in your own code.
+
 ## Span Names
 
 | Span | Description |

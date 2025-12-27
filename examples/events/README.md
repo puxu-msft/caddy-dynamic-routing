@@ -2,6 +2,14 @@
 
 Subscribe to routing events for monitoring, logging, and custom integrations.
 
+Navigation:
+
+- Back to examples index: [../README.md](../README.md)
+- Related: [../admin-api/README.md](../admin-api/README.md)
+- Related: [../metrics/README.md](../metrics/README.md)
+
+Note: the core routing path does not emit these events by default. Events are emitted only when code explicitly creates and uses an `EventEmitter` (see the `caddyslb` package). Treat this directory as an API/how-to reference for wiring events into your own integration.
+
 ## Available Events
 
 | Event | Description |

@@ -1,9 +1,15 @@
 package sql
 
 import (
+	"context"
 	"testing"
+	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/caddyserver/caddy/v2"
+
+	"github.com/puxu-msft/caddy-dynamic-routing/datasource"
+	"github.com/puxu-msft/caddy-dynamic-routing/datasource/cache"
 )
 
 func TestSQLSourceCaddyModule(t *testing.T) {
@@ -139,6 +145,27 @@ func TestSQLSourceValidate(t *testing.T) {
 			wantErr: true,
 			errMsg:  "max_cache_size must be non-negative",
 		},
+		{
+			name: "invalid refresh mode",
+			source: &SQLSource{
+				Driver:      "mysql",
+				DSN:         "user:pass@tcp(localhost)/db",
+				RefreshMode: "wat",
+			},
+			wantErr: true,
+			errMsg:  "refresh_mode must be",
+		},
+		{
+			name: "incremental requires updated_at_column",
+			source: &SQLSource{
+				Driver:          "mysql",
+				DSN:             "user:pass@tcp(localhost)/db",
+				RefreshMode:     refreshModeIncremental,
+				UpdatedAtColumn: "",
+			},
+			wantErr: true,
+			errMsg:  "updated_at_column is required",
+		},
 	}
 
 	for _, tt := range tests {
@@ -182,10 +209,10 @@ func TestSQLSourceHealthy(t *testing.T) {
 
 func TestSQLSourceCreateTableSQL(t *testing.T) {
 	tests := []struct {
-		name     string
-		driver   string
-		table    string
-		wantSQL  string
+		name    string
+		driver  string
+		table   string
+		wantSQL string
 	}{
 		{
 			name:    "mysql",
@@ -215,6 +242,183 @@ func TestSQLSourceCreateTableSQL(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSQLSourceGet_RespectsDeletedAtColumn(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() {
+		mock.ExpectClose()
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("Failed to close db: %v", closeErr)
+		}
+		if expErr := mock.ExpectationsWereMet(); expErr != nil {
+			t.Errorf("expectations: %v", expErr)
+		}
+	})
+
+	s := &SQLSource{
+		Driver:          "postgres",
+		Table:           "routing_configs",
+		KeyColumn:       "routing_key",
+		ConfigColumn:    "config",
+		DeletedAtColumn: "deleted_at",
+		db:              db,
+		cache:           cache.NewRouteCache(100),
+	}
+	s.healthy.Store(true)
+
+	mock.ExpectQuery(`SELECT config FROM routing_configs WHERE routing_key = \$1 AND deleted_at IS NULL`).
+		WithArgs("k1").
+		WillReturnRows(sqlmock.NewRows([]string{"config"}).AddRow("127.0.0.1:80"))
+
+	cfg, err := s.Get(context.Background(), "k1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if cfg == nil || cfg.Upstream != "127.0.0.1:80" {
+		t.Fatalf("unexpected config: %#v", cfg)
+	}
+}
+
+func TestSQLSourceRefreshFull_RemovesMissingKeys(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() {
+		mock.ExpectClose()
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("Failed to close db: %v", closeErr)
+		}
+		if expErr := mock.ExpectationsWereMet(); expErr != nil {
+			t.Errorf("expectations: %v", expErr)
+		}
+	})
+
+	s := &SQLSource{
+		Driver:       "postgres",
+		Table:        "routing_configs",
+		KeyColumn:    "routing_key",
+		ConfigColumn: "config",
+		db:           db,
+		cache:        cache.NewRouteCache(100),
+		ctx:          context.Background(),
+	}
+	s.cache.Set("a", mustParse(t, "127.0.0.1:80"))
+	s.cache.Set("b", mustParse(t, "127.0.0.1:81"))
+
+	mock.ExpectQuery("SELECT routing_key, config FROM routing_configs").
+		WillReturnRows(sqlmock.NewRows([]string{"routing_key", "config"}).AddRow("a", "127.0.0.1:80"))
+
+	if err := s.refreshFull(); err != nil {
+		t.Fatalf("refreshFull: %v", err)
+	}
+	if s.cache.Get("b") != nil {
+		t.Fatalf("expected key b to be removed")
+	}
+}
+
+func TestSQLSourceRefreshIncremental_AdvancesCursor(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() {
+		mock.ExpectClose()
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("Failed to close db: %v", closeErr)
+		}
+		if expErr := mock.ExpectationsWereMet(); expErr != nil {
+			t.Errorf("expectations: %v", expErr)
+		}
+	})
+
+	base := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	t1 := base.Add(1 * time.Minute)
+	t2 := base.Add(2 * time.Minute)
+
+	s := &SQLSource{
+		Driver:          "postgres",
+		Table:           "routing_configs",
+		KeyColumn:       "routing_key",
+		ConfigColumn:    "config",
+		UpdatedAtColumn: "updated_at",
+		RefreshMode:     refreshModeIncremental,
+		db:              db,
+		cache:           cache.NewRouteCache(100),
+		ctx:             context.Background(),
+	}
+	s.incCursorTime = base
+	s.incCursorKey = ""
+
+	mock.ExpectQuery(`SELECT routing_key, config, updated_at FROM routing_configs WHERE \(updated_at > \$1\) OR \(updated_at = \$1 AND routing_key > \$2\) ORDER BY updated_at ASC, routing_key ASC`).
+		WithArgs(base, "").
+		WillReturnRows(sqlmock.NewRows([]string{"routing_key", "config", "updated_at"}).
+			AddRow("a", "127.0.0.1:80", t1).
+			AddRow("b", "127.0.0.1:81", t2))
+
+	if err := s.refreshIncremental(); err != nil {
+		t.Fatalf("refreshIncremental: %v", err)
+	}
+	if s.cache.Get("a") == nil || s.cache.Get("b") == nil {
+		t.Fatalf("expected cache to contain a and b")
+	}
+
+	s.cursorMu.Lock()
+	gotT, gotK := s.incCursorTime, s.incCursorKey
+	s.cursorMu.Unlock()
+	if !gotT.Equal(t2) || gotK != "b" {
+		t.Fatalf("expected cursor (%v,%q), got (%v,%q)", t2, "b", gotT, gotK)
+	}
+}
+
+func TestSQLSourceRefreshOnce_IncrementalWithPeriodicFullRefresh(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	t.Cleanup(func() {
+		mock.ExpectClose()
+		if closeErr := db.Close(); closeErr != nil {
+			t.Errorf("Failed to close db: %v", closeErr)
+		}
+		if expErr := mock.ExpectationsWereMet(); expErr != nil {
+			t.Errorf("expectations: %v", expErr)
+		}
+	})
+
+	s := &SQLSource{
+		Driver:              "postgres",
+		Table:               "routing_configs",
+		KeyColumn:           "routing_key",
+		ConfigColumn:        "config",
+		UpdatedAtColumn:     "updated_at",
+		RefreshMode:         refreshModeIncremental,
+		FullRefreshInterval: caddy.Duration(10 * time.Second),
+		db:                  db,
+		cache:               cache.NewRouteCache(100),
+		ctx:                 context.Background(),
+	}
+
+	// Force a full refresh by having lastFullRefresh be zero.
+	mock.ExpectQuery("SELECT routing_key, config FROM routing_configs").
+		WillReturnRows(sqlmock.NewRows([]string{"routing_key", "config"}).AddRow("a", "127.0.0.1:80"))
+
+	if err := s.refreshOnce(); err != nil {
+		t.Fatalf("refreshOnce: %v", err)
+	}
+}
+
+func mustParse(t *testing.T, raw string) *datasource.RouteConfig {
+	t.Helper()
+	cfg, err := datasource.ParseRouteConfig([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseRouteConfig: %v", err)
+	}
+	return cfg
 }
 
 func containsStr(s, substr string) bool {

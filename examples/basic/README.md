@@ -2,6 +2,13 @@
 
 This example demonstrates basic dynamic routing with etcd as the data source.
 
+Navigation:
+
+- Back to examples index: [../README.md](../README.md)
+- Related: [../docker/README.md](../docker/README.md)
+- Next: [../datasources/README.md](../datasources/README.md)
+- Admin API: [../admin-api/README.md](../admin-api/README.md)
+
 ## Caddyfile
 
 ```caddy
@@ -69,4 +76,6 @@ curl http://example.com/api/users
 
 ## Docker Compose
 
-See [docker-compose.yaml](docker-compose.yaml) for a complete setup.
+This example does not ship a dedicated Docker Compose stack.
+
+Use the canonical Docker environment instead: [../docker/README.md](../docker/README.md)

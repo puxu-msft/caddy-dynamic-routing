@@ -53,6 +53,12 @@ type DynamicSelection struct {
 	// Used when no routing configuration is found or the data source is unavailable.
 	FallbackRaw json.RawMessage `json:"fallback,omitempty" caddy:"namespace=http.reverse_proxy.selection_policies inline_key=policy"`
 
+	// MetricsCardinality controls the cardinality of route hit/miss metrics.
+	// Allowed values:
+	//   - "detailed" (default): include routing key and upstream labels
+	//   - "coarse": collapse key/upstream labels to a constant to bound time series
+	MetricsCardinality string `json:"metrics_cardinality,omitempty"`
+
 	// Internal fields
 	keyExtractor       extractor.KeyExtractor
 	dataSource         datasource.DataSource
@@ -64,6 +70,8 @@ type DynamicSelection struct {
 	// Pool index for O(1) upstream lookup (built lazily)
 	poolIndex    map[string]*reverseproxy.Upstream
 	lastPoolSize int // Track pool size for cache invalidation
+
+	adminName string
 }
 
 // CaddyModule returns the Caddy module information.
@@ -78,6 +86,12 @@ func (DynamicSelection) CaddyModule() caddy.ModuleInfo {
 func (s *DynamicSelection) Provision(ctx caddy.Context) error {
 	s.logger = ctx.Logger()
 	s.ruleMatcher = matcher.NewRuleMatcher()
+
+	if s.MetricsCardinality != "" {
+		if err := metrics.SetRouteMetricsCardinalityFromString(s.MetricsCardinality); err != nil {
+			return fmt.Errorf("invalid metrics_cardinality: %v", err)
+		}
+	}
 
 	// Parse key expression
 	if s.Key != "" {
@@ -111,6 +125,16 @@ func (s *DynamicSelection) Provision(ctx caddy.Context) error {
 		s.fallback = new(reverseproxy.RandomSelection)
 	}
 
+	// Register this policy instance for Admin API inspection.
+	// Note: this registry is best-effort for debugging/ops and does not affect routing behavior.
+	s.adminName = registerSelectionPolicy(SelectionPolicyInfo{
+		ModuleID:           "http.reverse_proxy.selection_policies.dynamic",
+		Key:                s.Key,
+		DataSourceType:     s.dataSourceTypeForAdmin(),
+		DataSourceModuleID: s.dataSourceModuleID(),
+		FallbackPolicy:     s.fallbackPolicyID(),
+	})
+
 	s.logger.Info("dynamic selection policy provisioned",
 		zap.String("key", s.Key),
 		zap.Bool("has_datasource", s.dataSource != nil),
@@ -121,8 +145,40 @@ func (s *DynamicSelection) Provision(ctx caddy.Context) error {
 
 // Cleanup releases resources.
 func (s *DynamicSelection) Cleanup() error {
+	unregisterSelectionPolicy(s.adminName)
 	// Data source cleanup is handled by its own CleanerUpper implementation
 	return nil
+}
+
+func (s *DynamicSelection) dataSourceTypeForAdmin() string {
+	if s.dataSource == nil {
+		return ""
+	}
+	// Prefer the cached/parsed type name.
+	if s.dataSourceTypeName != "" && s.dataSourceTypeName != "unknown" {
+		return s.dataSourceTypeName
+	}
+	return s.computeDataSourceType()
+}
+
+func (s *DynamicSelection) fallbackPolicyID() string {
+	if s.fallback == nil {
+		return ""
+	}
+	if mod, ok := s.fallback.(caddy.Module); ok {
+		return string(mod.CaddyModule().ID)
+	}
+	return fmt.Sprintf("%T", s.fallback)
+}
+
+func (s *DynamicSelection) dataSourceModuleID() string {
+	if s.dataSource == nil {
+		return ""
+	}
+	if mod, ok := s.dataSource.(caddy.Module); ok {
+		return string(mod.CaddyModule().ID)
+	}
+	return fmt.Sprintf("%T", s.dataSource)
 }
 
 // Select selects an upstream from the pool based on dynamic routing configuration.
@@ -137,12 +193,14 @@ func (s *DynamicSelection) Select(pool reverseproxy.UpstreamPool, r *http.Reques
 	if replVal == nil {
 		s.logger.Debug("no replacer in context, using fallback")
 		metrics.RecordRouteMiss("", metrics.MissReasonNoReplacer)
+		routeStatsRegistry.RecordMiss("", string(metrics.MissReasonNoReplacer))
 		return s.fallback.Select(pool, r, w)
 	}
 	repl, ok := replVal.(*caddy.Replacer)
 	if !ok || repl == nil {
 		s.logger.Debug("invalid replacer type in context, using fallback")
 		metrics.RecordRouteMiss("", metrics.MissReasonNoReplacer)
+		routeStatsRegistry.RecordMiss("", string(metrics.MissReasonNoReplacer))
 		return s.fallback.Select(pool, r, w)
 	}
 
@@ -150,8 +208,10 @@ func (s *DynamicSelection) Select(pool reverseproxy.UpstreamPool, r *http.Reques
 	if s.keyExtractor == nil || s.dataSource == nil {
 		if s.keyExtractor == nil {
 			metrics.RecordRouteMiss("", metrics.MissReasonNoKeyExtractor)
+			routeStatsRegistry.RecordMiss("", string(metrics.MissReasonNoKeyExtractor))
 		} else {
 			metrics.RecordRouteMiss("", metrics.MissReasonNoDataSource)
+			routeStatsRegistry.RecordMiss("", string(metrics.MissReasonNoDataSource))
 		}
 		return s.fallback.Select(pool, r, w)
 	}
@@ -161,17 +221,13 @@ func (s *DynamicSelection) Select(pool reverseproxy.UpstreamPool, r *http.Reques
 	if key == "" {
 		s.logger.Debug("no routing key extracted, using fallback")
 		metrics.RecordRouteMiss("", metrics.MissReasonNoKey)
+		routeStatsRegistry.RecordMiss("", string(metrics.MissReasonNoKey))
 		return s.fallback.Select(pool, r, w)
 	}
 
-	// Check data source health
-	if !s.dataSource.Healthy() {
-		s.logger.Debug("data source unhealthy, using fallback",
-			zap.String("key", key),
-		)
-		metrics.RecordRouteMiss(key, metrics.MissReasonUnhealthy)
-		return s.fallback.Select(pool, r, w)
-	}
+	// Read health for observability, but do NOT short-circuit on it.
+	// Data sources are expected to be able to serve cached configs even when unhealthy.
+	dsHealthy := s.dataSource.Healthy()
 
 	// Get routing configuration with timing
 	timer := metrics.NewTimer()
@@ -184,14 +240,43 @@ func (s *DynamicSelection) Select(pool reverseproxy.UpstreamPool, r *http.Reques
 			zap.Error(err),
 		)
 		metrics.RecordRouteMiss(key, metrics.MissReasonError)
+		routeStatsRegistry.RecordMiss(key, string(metrics.MissReasonError))
 		return s.fallback.Select(pool, r, w)
 	}
 
 	if config == nil {
+		if !dsHealthy {
+			s.logger.Debug("data source unhealthy and no cached config available, using fallback",
+				zap.String("key", key),
+			)
+			metrics.RecordRouteMiss(key, metrics.MissReasonUnhealthy)
+			routeStatsRegistry.RecordMiss(key, string(metrics.MissReasonUnhealthy))
+			return s.fallback.Select(pool, r, w)
+		}
+
 		s.logger.Debug("no route config found",
 			zap.String("key", key),
 		)
 		metrics.RecordRouteMiss(key, metrics.MissReasonNoConfig)
+		routeStatsRegistry.RecordMiss(key, string(metrics.MissReasonNoConfig))
+		return s.fallback.Select(pool, r, w)
+	}
+
+	if !config.IsEnabled() {
+		s.logger.Debug("route config disabled, using fallback",
+			zap.String("key", key),
+		)
+		metrics.RecordRouteMiss(key, metrics.MissReasonDisabled)
+		routeStatsRegistry.RecordMiss(key, string(metrics.MissReasonDisabled))
+		return s.fallback.Select(pool, r, w)
+	}
+
+	if config.IsExpired() {
+		s.logger.Debug("route config expired by ttl, using fallback",
+			zap.String("key", key),
+		)
+		metrics.RecordRouteMiss(key, metrics.MissReasonExpired)
+		routeStatsRegistry.RecordMiss(key, string(metrics.MissReasonExpired))
 		return s.fallback.Select(pool, r, w)
 	}
 
@@ -205,6 +290,7 @@ func (s *DynamicSelection) Select(pool reverseproxy.UpstreamPool, r *http.Reques
 			zap.String("key", key),
 		)
 		metrics.RecordRouteMiss(key, metrics.MissReasonNoMatch)
+		routeStatsRegistry.RecordMiss(key, string(metrics.MissReasonNoMatch))
 		return s.fallback.Select(pool, r, w)
 	}
 
@@ -216,6 +302,7 @@ func (s *DynamicSelection) Select(pool reverseproxy.UpstreamPool, r *http.Reques
 			zap.String("target", targetUpstream.Address),
 		)
 		metrics.RecordRouteMiss(key, metrics.MissReasonNotInPool)
+		routeStatsRegistry.RecordMiss(key, string(metrics.MissReasonNotInPool))
 		return s.fallback.Select(pool, r, w)
 	}
 
@@ -226,6 +313,7 @@ func (s *DynamicSelection) Select(pool reverseproxy.UpstreamPool, r *http.Reques
 
 	// Record successful route hit
 	metrics.RecordRouteHit(key, targetUpstream.Address)
+	routeStatsRegistry.RecordHit(key, targetUpstream.Address)
 
 	return upstream
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
@@ -204,6 +205,81 @@ func TestDynamicSelection_Select_ConfigNotFound(t *testing.T) {
 	req := httptest.NewRequest("GET", "/test", nil)
 	repl := caddy.NewReplacer()
 	repl.Set("http.request.header.X-Tenant", "tenant-xyz")
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	req = req.WithContext(ctx)
+
+	result := s.Select(pool, req, nil)
+	if result == nil {
+		t.Error("Expected fallback to return an upstream")
+	}
+}
+
+func TestDynamicSelection_Select_DisabledConfig(t *testing.T) {
+	keyExt, _ := extractor.NewFromExpression("{header.X-Tenant}")
+	disabled := false
+	mock := &mockDataSource{
+		configs: map[string]*datasource.RouteConfig{
+			"tenant-a": {Upstream: "backend-a:8080", Enabled: &disabled},
+		},
+		healthy: true,
+	}
+
+	s := &DynamicSelection{
+		logger:       zap.NewNop(),
+		fallback:     new(reverseproxy.RandomSelection),
+		keyExtractor: keyExt,
+		dataSource:   mock,
+		ruleMatcher:  matcher.NewRuleMatcher(),
+	}
+
+	pool := reverseproxy.UpstreamPool{
+		{Dial: "backend-a:8080"},
+		{Dial: "backend-b:8080"},
+	}
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	repl := caddy.NewReplacer()
+	repl.Set("http.request.header.X-Tenant", "tenant-a")
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	req = req.WithContext(ctx)
+
+	result := s.Select(pool, req, nil)
+	if result == nil {
+		t.Error("Expected fallback to return an upstream")
+	}
+}
+
+func TestDynamicSelection_Select_ExpiredConfig(t *testing.T) {
+	keyExt, _ := extractor.NewFromExpression("{header.X-Tenant}")
+
+	// Mark config as expired via TTL and UpdatedAt.
+	mock := &mockDataSource{
+		configs: map[string]*datasource.RouteConfig{
+			"tenant-a": {
+				Upstream:  "backend-a:8080",
+				TTL:       10 * time.Millisecond,
+				UpdatedAt: time.Now().Add(-time.Second),
+			},
+		},
+		healthy: true,
+	}
+
+	s := &DynamicSelection{
+		logger:       zap.NewNop(),
+		fallback:     new(reverseproxy.RandomSelection),
+		keyExtractor: keyExt,
+		dataSource:   mock,
+		ruleMatcher:  matcher.NewRuleMatcher(),
+	}
+
+	pool := reverseproxy.UpstreamPool{
+		{Dial: "backend-a:8080"},
+		{Dial: "backend-b:8080"},
+	}
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	repl := caddy.NewReplacer()
+	repl.Set("http.request.header.X-Tenant", "tenant-a")
 	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
 	req = req.WithContext(ctx)
 

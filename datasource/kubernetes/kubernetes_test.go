@@ -2,6 +2,7 @@ package kubernetes
 
 import (
 	"testing"
+	"time"
 
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 )
@@ -181,6 +182,14 @@ func TestKubernetesSourceUnmarshalCaddyfile(t *testing.T) {
 				return k.MaxCacheSize == 5000
 			},
 			checkDesc: "max_cache_size should be 5000",
+		},
+		{
+			name:  "initial_load_timeout config",
+			input: "kubernetes {\n    initial_load_timeout 45s\n}",
+			check: func(k *KubernetesSource) bool {
+				return time.Duration(k.InitialLoadTimeout) == 45*time.Second
+			},
+			checkDesc: "initial_load_timeout should be 45s",
 		},
 		{
 			name:  "full config",

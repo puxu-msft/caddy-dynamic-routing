@@ -58,15 +58,15 @@ func NewFromExpression(expr string) (KeyExtractor, error) {
 // e.g., {header.X-Tenant} -> {http.request.header.X-Tenant}
 func expandShortcuts(expr string) string {
 	shortcuts := map[string]string{
-		"{header.":  "{http.request.header.",
-		"{cookie.":  "{http.request.cookie.",
-		"{query.":   "{http.request.uri.query.",
-		"{path.":    "{http.request.uri.path.",
-		"{path}":    "{http.request.uri.path}",
-		"{host}":    "{http.request.host}",
-		"{method}":  "{http.request.method}",
-		"{remote}":  "{http.request.remote}",
-		"{scheme}":  "{http.request.scheme}",
+		"{header.": "{http.request.header.",
+		"{cookie.": "{http.request.cookie.",
+		"{query.":  "{http.request.uri.query.",
+		"{path.":   "{http.request.uri.path.",
+		"{path}":   "{http.request.uri.path}",
+		"{host}":   "{http.request.host}",
+		"{method}": "{http.request.method}",
+		"{remote}": "{http.request.remote}",
+		"{scheme}": "{http.request.scheme}",
 	}
 
 	result := expr
@@ -78,10 +78,9 @@ func expandShortcuts(expr string) string {
 
 // parseExpression parses an expression into literal and placeholder parts.
 func parseExpression(expr string) []expressionPart {
-	var parts []expressionPart
-
 	lastEnd := 0
 	matches := placeholderRegex.FindAllStringIndex(expr, -1)
+	parts := make([]expressionPart, 0, len(matches)*2+1)
 
 	for _, match := range matches {
 		// Add literal part before this placeholder

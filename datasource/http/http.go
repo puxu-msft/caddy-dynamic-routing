@@ -19,6 +19,7 @@ import (
 
 	"github.com/puxu-msft/caddy-dynamic-routing/datasource"
 	"github.com/puxu-msft/caddy-dynamic-routing/datasource/cache"
+	"github.com/puxu-msft/caddy-dynamic-routing/metrics"
 )
 
 func init() {
@@ -79,6 +80,10 @@ type HTTPSource struct {
 	cancelRefresh context.CancelFunc
 	refreshWg     sync.WaitGroup
 	sfGroup       singleflight.Group // Coalesce concurrent requests for same key
+
+	// Admin / diagnostics
+	adminName string
+	lastError atomic.Value // string
 }
 
 // CaddyModule returns the Caddy module information.
@@ -140,9 +145,11 @@ func (h *HTTPSource) Provision(ctx caddy.Context) error {
 	// Initial health check
 	if err := h.healthCheck(); err != nil {
 		h.logger.Warn("initial health check failed", zap.Error(err))
+		h.lastError.Store(err.Error())
 		h.healthy.Store(false)
 	} else {
 		h.healthy.Store(true)
+		h.lastError.Store("")
 	}
 
 	// Start background refresh if configured
@@ -159,11 +166,17 @@ func (h *HTTPSource) Provision(ctx caddy.Context) error {
 		zap.Duration("cache_ttl", time.Duration(h.CacheTTL)),
 	)
 
+	// Register for Admin API inspection
+	h.adminName = datasource.RegisterAdminSource(h)
+
 	return nil
 }
 
 // Cleanup releases resources.
 func (h *HTTPSource) Cleanup() error {
+	datasource.UnregisterAdminSource(h.adminName)
+	h.adminName = ""
+
 	if h.cancelRefresh != nil {
 		h.cancelRefresh()
 	}
@@ -204,6 +217,7 @@ func (h *HTTPSource) Get(ctx context.Context, key string) (*datasource.RouteConf
 		config, err := h.fetch(ctx, key)
 		if err != nil {
 			h.logger.Warn("HTTP fetch failed", zap.String("key", key), zap.Error(err))
+			h.lastError.Store(err.Error())
 			return nil, err
 		}
 
@@ -221,10 +235,60 @@ func (h *HTTPSource) Get(ctx context.Context, key string) (*datasource.RouteConf
 	if err != nil {
 		return nil, err
 	}
+	h.lastError.Store("")
 	if result == nil {
 		return nil, nil
 	}
 	return result.(*datasource.RouteConfig), nil
+}
+
+// AdminType returns the short type name for Admin API.
+func (*HTTPSource) AdminType() string { return "http" }
+
+// AdminLastError returns the most recent error message (best-effort).
+func (h *HTTPSource) AdminLastError() string {
+	if v := h.lastError.Load(); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// AdminListRoutes returns a snapshot of cached routes.
+func (h *HTTPSource) AdminListRoutes() []datasource.AdminRouteInfo {
+	if h.cache == nil {
+		return nil
+	}
+	routes := make([]datasource.AdminRouteInfo, 0, h.cache.Len())
+	h.cache.Range(func(k string, cfg *datasource.RouteConfig) bool {
+		routes = append(routes, datasource.SummarizeRouteConfig(k, cfg))
+		return true
+	})
+	return routes
+}
+
+// AdminCacheStats returns a snapshot of internal cache stats.
+func (h *HTTPSource) AdminCacheStats() datasource.AdminCacheStats {
+	if h.cache == nil {
+		return datasource.AdminCacheStats{}
+	}
+	hits, misses, negativeHits, hitRate := h.cache.Stats()
+	return datasource.AdminCacheStats{
+		Entries:      h.cache.Len(),
+		MaxSize:      h.cache.MaxSize(),
+		Hits:         hits,
+		Misses:       misses,
+		NegativeHits: negativeHits,
+		HitRate:      hitRate,
+	}
+}
+
+// AdminClearCache clears all internal caches.
+func (h *HTTPSource) AdminClearCache() {
+	if h.cache != nil {
+		h.cache.Clear()
+	}
 }
 
 // Healthy returns true if the HTTP endpoint is healthy.
@@ -287,7 +351,11 @@ func (h *HTTPSource) doFetch(ctx context.Context, url string) (*datasource.Route
 	if err != nil {
 		return nil, fmt.Errorf("executing request: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			h.logger.Debug("failed to close response body", zap.Error(closeErr))
+		}
+	}()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, errNotFound
@@ -309,6 +377,7 @@ func (h *HTTPSource) doFetch(ctx context.Context, url string) (*datasource.Route
 
 	config, err := datasource.ParseRouteConfig(body)
 	if err != nil {
+		metrics.RecordRouteConfigParseError(h.AdminType())
 		return nil, fmt.Errorf("parsing response: %v", err)
 	}
 
@@ -333,7 +402,9 @@ func (h *HTTPSource) healthCheck() error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	if err := resp.Body.Close(); err != nil {
+		h.logger.Debug("failed to close health check response body", zap.Error(err))
+	}
 
 	if resp.StatusCode >= 500 {
 		return fmt.Errorf("health check returned %d", resp.StatusCode)

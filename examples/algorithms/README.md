@@ -2,6 +2,13 @@
 
 This directory contains examples for each supported load balancing algorithm.
 
+Navigation:
+
+- Back to examples index: [../README.md](../README.md)
+- Related: [../basic/README.md](../basic/README.md)
+- Related: [../multi-tenant/README.md](../multi-tenant/README.md)
+- Data source configs: [../datasources/README.md](../datasources/README.md)
+
 ## Available Algorithms
 
 | Algorithm | Description | Use Case |

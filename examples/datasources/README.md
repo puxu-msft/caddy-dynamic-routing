@@ -2,6 +2,25 @@
 
 This directory contains examples for each supported data source.
 
+Navigation:
+
+- Back to examples index: [../README.md](../README.md)
+- Related: [../basic/README.md](../basic/README.md)
+- Composite example: [../composite/README.md](../composite/README.md)
+- Developer guide (adding a new data source): [../dev-guide/adding-datasource.md](../dev-guide/adding-datasource.md)
+
+Contents:
+
+- [Supported Data Sources](#supported-data-sources)
+- [etcd Configuration](#etcd-configuration)
+- [Redis Configuration](#redis-configuration)
+- [Consul Configuration](#consul-configuration)
+- [File Configuration](#file-configuration)
+- [HTTP Configuration](#http-configuration)
+- [Zookeeper Configuration](#zookeeper-configuration)
+- [SQL Configuration](#sql-configuration)
+- [Kubernetes Configuration](#kubernetes-configuration)
+
 ## Supported Data Sources
 
 | Source | Description | Use Case |
@@ -26,6 +45,8 @@ lb_policy dynamic {
         endpoints etcd1:2379 etcd2:2379 etcd3:2379
         prefix /caddy/routing/
         dial_timeout 5s
+        # Optional: cap initial full load time (defaults to dial_timeout)
+        # initial_load_timeout 30s
 
         # Optional: TLS
         tls {
@@ -48,9 +69,13 @@ lb_policy dynamic {
     key {http.request.header.X-Tenant}
 
     redis {
+        # Use a single address
         addr redis:6379
         prefix routing:
         db 0
+
+        # Optional: cap initial full load time (defaults to dial_timeout)
+        # initial_load_timeout 30s
 
         # Optional: Authentication
         password secret
@@ -69,10 +94,13 @@ lb_policy dynamic {
     key {http.request.header.X-Tenant}
 
     consul {
-        addr consul:8500
+        address consul:8500
         prefix caddy/routing/
         token <acl-token>
         datacenter dc1
+
+        # Optional: cap initial full load time (default: 30s)
+        # initial_load_timeout 30s
     }
 }
 ```
@@ -124,12 +152,16 @@ lb_policy dynamic {
 
     zookeeper {
         servers zk1:2181 zk2:2181 zk3:2181
-        prefix /caddy/routing/
+        base_path /caddy/routing
         session_timeout 10s
-        connect_timeout 5s
+        max_cache_size 10000
+
+        # Optional: cap initial full load time (default: 30s)
+        # initial_load_timeout 30s
 
         # Optional: Authentication
-        auth digest user:password
+        username user
+        password password
     }
 }
 ```
@@ -147,10 +179,14 @@ lb_policy dynamic {
         dsn "user:password@tcp(localhost:3306)/caddy"
         table routing_configs
         key_column route_key
-        value_column config
+        config_column config
         poll_interval 30s
         max_open_conns 10
         max_idle_conns 5
+        max_cache_size 10000
+
+        # Optional: cap initial full load time (default: 30s)
+        # initial_load_timeout 30s
     }
 }
 ```
@@ -166,8 +202,12 @@ lb_policy dynamic {
         dsn "postgres://user:password@localhost:5432/caddy?sslmode=disable"
         table routing_configs
         key_column route_key
-        value_column config
+        config_column config
         poll_interval 30s
+        max_cache_size 10000
+
+        # Optional: cap initial full load time (default: 30s)
+        # initial_load_timeout 30s
     }
 }
 ```
@@ -182,6 +222,9 @@ lb_policy dynamic {
         namespace production
         configmap_name caddy-routes
         label_selector app=caddy
+
+        # Optional: cap initial full load time (default: 30s)
+        # initial_load_timeout 30s
 
         # Optional: Use external kubeconfig (defaults to in-cluster config)
         # kubeconfig /path/to/kubeconfig

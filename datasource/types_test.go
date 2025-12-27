@@ -232,6 +232,7 @@ func TestDetectFormat(t *testing.T) {
 		{"IP:port", "192.168.1.1:8080", "simple"},
 		{"multi-line", "upstream: a\nfallback: b", "yaml"},
 		{"YAML key-value", "upstream: backend", "yaml"},
+		{"single-line upstream-like", "backend:svc", "simple"},
 	}
 
 	for _, tt := range tests {
@@ -241,6 +242,28 @@ func TestDetectFormat(t *testing.T) {
 				t.Errorf("detectFormat(%q) = %s, want %s", tt.input, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestParseRouteConfig_InvalidJSONReturnsError(t *testing.T) {
+	input := `{"upstream": backend:8080}`
+	config, err := ParseRouteConfig([]byte(input))
+	if err == nil {
+		t.Fatalf("expected error, got nil (config=%+v)", config)
+	}
+	if config != nil {
+		t.Fatalf("expected nil config on parse error, got %+v", config)
+	}
+}
+
+func TestParseRouteConfig_InvalidYAMLReturnsError(t *testing.T) {
+	input := "upstream: [unclosed"
+	config, err := ParseRouteConfig([]byte(input))
+	if err == nil {
+		t.Fatalf("expected error, got nil (config=%+v)", config)
+	}
+	if config != nil {
+		t.Fatalf("expected nil config on parse error, got %+v", config)
 	}
 }
 

@@ -2,6 +2,7 @@ package datasource
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -124,7 +125,7 @@ func ParseRouteConfigWithFormat(data []byte, format string) (*RouteConfig, error
 		// Check for JSON string first
 		if trimmed[0] == '"' {
 			var simpleUpstream string
-			if err := json.Unmarshal(data, &simpleUpstream); err == nil {
+			if unmarshalErr := json.Unmarshal(data, &simpleUpstream); unmarshalErr == nil {
 				return &RouteConfig{Upstream: simpleUpstream}, nil
 			}
 		}
@@ -137,14 +138,15 @@ func ParseRouteConfigWithFormat(data []byte, format string) (*RouteConfig, error
 	}
 
 	if err != nil {
-		// If parsing fails, treat as simple upstream
-		return &RouteConfig{Upstream: trimmed}, nil
+		// Parsing failed: do NOT silently treat it as a simple upstream.
+		// This avoids hiding invalid JSON/YAML configs under load.
+		return nil, fmt.Errorf("parse route config (%s): %w", format, err)
 	}
 
 	// Check if it's a valid config (has upstream or rules)
 	if config.Upstream == "" && len(config.Rules) == 0 {
-		// Empty config, treat as simple upstream
-		return &RouteConfig{Upstream: trimmed}, nil
+		// Empty structured config: treat as invalid rather than silently accepting.
+		return nil, fmt.Errorf("parse route config (%s): empty config (missing upstream and rules)", format)
 	}
 
 	// Post-process the config
@@ -164,20 +166,19 @@ func detectFormat(data string) string {
 		return "json"
 	}
 
-	// YAML indicators: lines starting with key:, - (list item), or multiple lines
+	// YAML indicators: multi-line content is likely YAML.
 	if strings.Contains(data, "\n") {
 		// Multi-line, likely YAML
 		return "yaml"
 	}
 
-	// Check for YAML key: value pattern
-	if strings.Contains(data, ":") && !strings.Contains(data, "://") {
-		// Has colon but not a URL, could be YAML
+	// Single-line YAML mapping heuristic.
+	// Only treat as YAML when it looks like "key: value" (note the space).
+	// This prevents misclassifying upstream-like values such as "backend:svc" as YAML.
+	if strings.Contains(data, ": ") && !strings.Contains(data, "://") {
 		parts := strings.SplitN(data, ":", 2)
 		if len(parts) == 2 && strings.TrimSpace(parts[0]) != "" {
-			// If the first part looks like a key (no spaces at start), it's likely YAML
 			if !strings.HasPrefix(parts[0], " ") && !strings.HasPrefix(parts[0], "\t") {
-				// But if it looks like host:port, treat as simple
 				if isHostPort(data) {
 					return "simple"
 				}

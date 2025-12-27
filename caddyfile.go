@@ -84,6 +84,12 @@ func (s *DynamicSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				s.Key = d.Val()
 
+			case "metrics_cardinality":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				s.MetricsCardinality = d.Val()
+
 			case "etcd":
 				etcdSource := &etcd.EtcdSource{}
 				if err := etcdSource.UnmarshalCaddyfile(d.NewFromNextSegment()); err != nil {

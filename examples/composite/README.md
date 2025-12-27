@@ -2,6 +2,13 @@
 
 Combine multiple data sources for high availability and flexibility.
 
+Navigation:
+
+- Back to examples index: [../README.md](../README.md)
+- Data source configs: [../datasources/README.md](../datasources/README.md)
+- Admin API: [../admin-api/README.md](../admin-api/README.md)
+- Metrics: [../metrics/README.md](../metrics/README.md)
+
 ## Modes
 
 | Mode | Description |

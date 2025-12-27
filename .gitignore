@@ -29,6 +29,7 @@ Thumbs.db
 
 # Claude Code
 .claude/
+/TODO.md
 
 # Build artifacts
 dist/

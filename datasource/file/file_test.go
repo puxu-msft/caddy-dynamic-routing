@@ -15,11 +15,17 @@ func TestFileSourceDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	t.Cleanup(func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			t.Errorf("Failed to remove temp dir: %v", err)
+		}
+	})
 
 	// Create test files
-	os.WriteFile(filepath.Join(tmpDir, "tenant-a"), []byte("backend-a:8080"), 0644)
-	os.WriteFile(filepath.Join(tmpDir, "tenant-b.json"), []byte(`{
+	if err := os.WriteFile(filepath.Join(tmpDir, "tenant-a"), []byte("backend-a:8080"), 0644); err != nil {
+		t.Fatalf("Failed to write tenant-a file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "tenant-b.json"), []byte(`{
 		"rules": [
 			{
 				"match": {"http.request.header.X-Version": "v2"},
@@ -28,7 +34,9 @@ func TestFileSourceDirectory(t *testing.T) {
 			}
 		],
 		"fallback": "random"
-	}`), 0644)
+	}`), 0644); err != nil {
+		t.Fatalf("Failed to write tenant-b.json file: %v", err)
+	}
 
 	// Create and test the data source without Caddy context
 	watchEnabled := false
@@ -97,7 +105,7 @@ func TestFileSourceSingleFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
-	tmpFile.WriteString(`{
+	if _, err := tmpFile.WriteString(`{
 		"tenant-a": "backend-a:8080",
 		"tenant-b": {
 			"rules": [
@@ -109,9 +117,20 @@ func TestFileSourceSingleFile(t *testing.T) {
 			],
 			"fallback": "random"
 		}
-	}`)
-	tmpFile.Close()
-	defer os.Remove(tmpFile.Name())
+	}`); err != nil {
+		if closeErr := tmpFile.Close(); closeErr != nil {
+			t.Errorf("Failed to close temp file after write error: %v", closeErr)
+		}
+		t.Fatalf("Failed to write temp file: %v", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		t.Fatalf("Failed to close temp file: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Remove(tmpFile.Name()); err != nil {
+			t.Errorf("Failed to remove temp file: %v", err)
+		}
+	})
 
 	// Create and test the data source without Caddy context
 	watchEnabled := false
@@ -164,10 +183,16 @@ func TestFileSourceReload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	t.Cleanup(func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			t.Errorf("Failed to remove temp dir: %v", err)
+		}
+	})
 
 	// Create initial file
-	os.WriteFile(filepath.Join(tmpDir, "tenant-a"), []byte("backend-a:8080"), 0644)
+	if err := os.WriteFile(filepath.Join(tmpDir, "tenant-a"), []byte("backend-a:8080"), 0644); err != nil {
+		t.Fatalf("Failed to write tenant-a file: %v", err)
+	}
 
 	// Create data source
 	watchEnabled := false
@@ -194,7 +219,9 @@ func TestFileSourceReload(t *testing.T) {
 	}
 
 	// Update file
-	os.WriteFile(filepath.Join(tmpDir, "tenant-a"), []byte("backend-a-updated:8080"), 0644)
+	if err := os.WriteFile(filepath.Join(tmpDir, "tenant-a"), []byte("backend-a-updated:8080"), 0644); err != nil {
+		t.Fatalf("Failed to update tenant-a file: %v", err)
+	}
 
 	// Manually reload
 	if err := source.loadAll(); err != nil {

@@ -3,11 +3,37 @@ package metrics
 import (
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func TestRecordRouteHit(t *testing.T) {
 	// Should not panic
 	RecordRouteHit("test-key", "backend:8080")
+}
+
+func TestRouteMetricsCardinalityMode(t *testing.T) {
+	if err := SetRouteMetricsCardinalityFromString("coarse"); err != nil {
+		t.Fatalf("SetRouteMetricsCardinalityFromString(coarse) returned error: %v", err)
+	}
+	if got := RouteMetricsCardinalityMode(); got != RouteMetricsCardinalityCoarse {
+		t.Fatalf("expected mode %q, got %q", RouteMetricsCardinalityCoarse, got)
+	}
+
+	// Should not panic in coarse mode.
+	RecordRouteHit("test-key", "backend:8080")
+	RecordRouteMiss("test-key", MissReasonNoConfig)
+
+	if err := SetRouteMetricsCardinalityFromString("detailed"); err != nil {
+		t.Fatalf("SetRouteMetricsCardinalityFromString(detailed) returned error: %v", err)
+	}
+	if got := RouteMetricsCardinalityMode(); got != RouteMetricsCardinalityDetailed {
+		t.Fatalf("expected mode %q, got %q", RouteMetricsCardinalityDetailed, got)
+	}
+
+	if err := SetRouteMetricsCardinalityFromString("nope"); err == nil {
+		t.Fatalf("expected error for invalid mode")
+	}
 }
 
 func TestRecordRouteMiss(t *testing.T) {
@@ -20,6 +46,32 @@ func TestRecordCacheOperations(t *testing.T) {
 	// Should not panic
 	RecordCacheHit("etcd")
 	RecordCacheMiss("redis")
+}
+
+func TestRecordRouteConfigParseError(t *testing.T) {
+	beforeEtcd := testutil.ToFloat64(RouteConfigParseErrors.WithLabelValues("etcd"))
+	beforeUnknown := testutil.ToFloat64(RouteConfigParseErrors.WithLabelValues("unknown"))
+
+	RecordRouteConfigParseError("etcd")
+	RecordRouteConfigParseError("")
+
+	afterEtcd := testutil.ToFloat64(RouteConfigParseErrors.WithLabelValues("etcd"))
+	afterUnknown := testutil.ToFloat64(RouteConfigParseErrors.WithLabelValues("unknown"))
+
+	if afterEtcd != beforeEtcd+1 {
+		t.Fatalf("expected etcd counter to increment by 1 (before=%v after=%v)", beforeEtcd, afterEtcd)
+	}
+	if afterUnknown != beforeUnknown+1 {
+		t.Fatalf("expected unknown counter to increment by 1 (before=%v after=%v)", beforeUnknown, afterUnknown)
+	}
+
+	snap := RouteConfigParseErrorSnapshot()
+	if snap["etcd"].Total == 0 {
+		t.Fatalf("expected snapshot to include etcd with non-zero total")
+	}
+	if snap["unknown"].Total == 0 {
+		t.Fatalf("expected snapshot to include unknown with non-zero total")
+	}
 }
 
 func TestSetDataSourceHealth(t *testing.T) {

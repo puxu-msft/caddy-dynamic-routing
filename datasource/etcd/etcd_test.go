@@ -31,17 +31,25 @@ func TestEtcdSourceIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create etcd client: %v", err)
 	}
-	defer client.Close()
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("Failed to close etcd client: %v", err)
+		}
+	})
 
 	testPrefix := "/caddy/test/routing/"
 
 	// Clean up test keys
-	client.Delete(ctx, testPrefix, clientv3.WithPrefix())
-	defer client.Delete(ctx, testPrefix, clientv3.WithPrefix())
+	if _, err := client.Delete(ctx, testPrefix, clientv3.WithPrefix()); err != nil {
+		t.Fatalf("Failed to delete test prefix: %v", err)
+	}
+	defer func() { _, _ = client.Delete(ctx, testPrefix, clientv3.WithPrefix()) }()
 
 	// Set up test data
-	client.Put(ctx, testPrefix+"tenant-a", "backend-a:8080")
-	client.Put(ctx, testPrefix+"tenant-b", `{
+	if _, err := client.Put(ctx, testPrefix+"tenant-a", "backend-a:8080"); err != nil {
+		t.Fatalf("Failed to put tenant-a: %v", err)
+	}
+	if _, err := client.Put(ctx, testPrefix+"tenant-b", `{
 		"rules": [
 			{
 				"match": {"http.request.header.X-Version": "v2"},
@@ -50,7 +58,9 @@ func TestEtcdSourceIntegration(t *testing.T) {
 			}
 		],
 		"fallback": "random"
-	}`)
+	}`); err != nil {
+		t.Fatalf("Failed to put tenant-b: %v", err)
+	}
 
 	// Create and provision the data source
 	source := &EtcdSource{
@@ -66,7 +76,7 @@ func TestEtcdSourceIntegration(t *testing.T) {
 	if err := source.Provision(caddyCtx); err != nil {
 		t.Fatalf("Provision failed: %v", err)
 	}
-	defer source.Cleanup()
+	defer func() { _ = source.Cleanup() }()
 
 	// Wait for initial load
 	time.Sleep(100 * time.Millisecond)
@@ -156,9 +166,7 @@ func TestEtcdSourceCaddyModule(t *testing.T) {
 }
 
 func TestEtcdSourceCacheOperations(t *testing.T) {
-	source := &EtcdSource{
-		Prefix: "/test/",
-	}
+	source := &EtcdSource{}
 
 	// Initialize cache
 	source.cache = cache.NewRouteCache(100)
