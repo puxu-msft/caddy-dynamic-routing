@@ -7,7 +7,7 @@ on:
     branches: [main, master]
 
 env:
-  GO_VERSION: '1.23'
+  GO_VERSION: '1.25.x'
 
 jobs:
   test:
@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go-version: ['1.22', '1.23']
+        go-version: ['1.25.x']
 
     steps:
       - name: Checkout code
@@ -40,7 +40,7 @@ jobs:
         run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
 
       - name: Upload coverage to Codecov
-        if: matrix.go-version == '1.23'
+        if: matrix.go-version == '1.25.x'
         uses: codecov/codecov-action@v4
         with:
           file: ./coverage.out
@@ -90,7 +90,7 @@ jobs:
           cache: true
 
       - name: Install xcaddy
-        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.5
 
       - name: Build caddy with plugin
         run: xcaddy build --with github.com/puxu-msft/caddy-dynamic-routing=./
@@ -116,6 +116,6 @@ jobs:
           cache: true
 
       - name: Run Gosec Security Scanner
-        uses: securego/gosec@master
+        uses: securego/gosec@v2.22.11
         with:
           args: -exclude=G104,G304 ./...

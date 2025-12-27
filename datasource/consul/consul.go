@@ -127,6 +127,7 @@ func (c *ConsulSource) Provision(ctx caddy.Context) error {
 			CertFile:           c.TLSCertFile,
 			KeyFile:            c.TLSKeyFile,
 			CAFile:             c.TLSCAFile,
+			// #nosec G402 -- configurable for dev/test environments; default is secure verification.
 			InsecureSkipVerify: c.TLSSkipVerify,
 		}
 	}

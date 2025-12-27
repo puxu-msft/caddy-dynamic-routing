@@ -131,6 +131,7 @@ func (h *HTTPSource) Provision(ctx caddy.Context) error {
 	// Create HTTP client
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
+			// #nosec G402 -- configurable for dev/test environments; default is secure verification.
 			InsecureSkipVerify: h.TLSSkipVerify,
 		},
 		MaxIdleConns:       100,

@@ -108,12 +108,12 @@ clean:
 ## docker-up: Start docker compose services for testing
 docker-up:
 	@echo "Starting docker services..."
-	docker compose -f examples/docker/docker-compose.yml up -d
+	docker compose -f examples/docker/docker-compose.yml up --build -d
 
 ## docker-down: Stop docker compose services
 docker-down:
 	@echo "Stopping docker services..."
-	docker compose -f examples/docker/docker-compose.yml down
+	docker compose -f examples/docker/docker-compose.yml down -v
 
 ## check: Run all checks (fmt, vet, lint, test)
 check: fmt-check vet lint test

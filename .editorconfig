@@ -9,6 +9,14 @@ trim_trailing_whitespace = true
 [*.go]
 indent_style = tab
 
+[Caddyfile]
+indent_style = space
+indent_size = 4
+
+[*.caddyfile]
+indent_style = space
+indent_size = 4
+
 [*.{yml,yaml,json,md}]
 indent_style = space
 indent_size = 2

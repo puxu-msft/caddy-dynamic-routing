@@ -421,6 +421,7 @@ func (e *EtcdSource) watch(ctx context.Context) error {
 // buildTLSConfig builds the TLS configuration for etcd.
 func (e *EtcdSource) buildTLSConfig() (*tls.Config, error) {
 	tlsConfig := &tls.Config{
+		// #nosec G402 -- configurable for dev/test environments; default is secure verification.
 		InsecureSkipVerify: e.TLSSkipVerify,
 	}
 

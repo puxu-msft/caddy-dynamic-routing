@@ -299,21 +299,21 @@ func (s *SQLSource) Get(ctx context.Context, key string) (*datasource.RouteConfi
 		}
 
 		// Fetch from database
-		//nolint:gosec,nolintlint // Identifiers are validated in Provision; key uses placeholders.
+		// #nosec G201 -- identifiers are validated in Provision; values use placeholders.
 		query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = $1",
 			s.ConfigColumn, s.Table, s.KeyColumn)
 		if s.DeletedAtColumn != "" {
-			//nolint:gosec,nolintlint // Identifiers are validated in Provision; key uses placeholders.
+			// #nosec G201 -- identifiers are validated in Provision; values use placeholders.
 			query = fmt.Sprintf("%s AND %s IS NULL", query, s.DeletedAtColumn)
 		}
 
 		// Adjust placeholder for MySQL
 		if s.Driver == "mysql" {
-			//nolint:gosec,nolintlint // Identifiers are validated in Provision; key uses placeholders.
+			// #nosec G201 -- identifiers are validated in Provision; values use placeholders.
 			query = fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?",
 				s.ConfigColumn, s.Table, s.KeyColumn)
 			if s.DeletedAtColumn != "" {
-				//nolint:gosec,nolintlint // Identifiers are validated in Provision; key uses placeholders.
+				// #nosec G201 -- identifiers are validated in Provision; values use placeholders.
 				query = fmt.Sprintf("%s AND %s IS NULL", query, s.DeletedAtColumn)
 			}
 		}
@@ -412,11 +412,11 @@ func (s *SQLSource) Healthy() bool {
 
 // initialLoad loads all existing configurations from the database.
 func (s *SQLSource) initialLoad(ctx context.Context) error {
-	//nolint:gosec,nolintlint // identifiers are validated in Provision
+	// #nosec G201 -- identifiers are validated in Provision; values use placeholders where applicable.
 	query := fmt.Sprintf("SELECT %s, %s FROM %s",
 		s.KeyColumn, s.ConfigColumn, s.Table)
 	if s.DeletedAtColumn != "" {
-		//nolint:gosec,nolintlint // identifiers are validated in Provision
+		// #nosec G201 -- identifiers are validated in Provision; values use placeholders where applicable.
 		query = fmt.Sprintf("%s WHERE %s IS NULL", query, s.DeletedAtColumn)
 	}
 
@@ -513,11 +513,11 @@ func (s *SQLSource) refreshOnce() error {
 
 // refreshFull reloads all configurations from the database.
 func (s *SQLSource) refreshFull() error {
-	//nolint:gosec,nolintlint // identifiers are validated in Provision
+	// #nosec G201 -- identifiers are validated in Provision; values use placeholders where applicable.
 	query := fmt.Sprintf("SELECT %s, %s FROM %s",
 		s.KeyColumn, s.ConfigColumn, s.Table)
 	if s.DeletedAtColumn != "" {
-		//nolint:gosec,nolintlint // identifiers are validated in Provision
+		// #nosec G201 -- identifiers are validated in Provision; values use placeholders where applicable.
 		query = fmt.Sprintf("%s WHERE %s IS NULL", query, s.DeletedAtColumn)
 	}
 
@@ -563,7 +563,7 @@ func (s *SQLSource) refreshFull() error {
 }
 
 func (s *SQLSource) initIncrementalCursor(ctx context.Context) error {
-	//nolint:gosec,nolintlint // identifiers are validated in Provision
+	// #nosec G201 -- identifiers are validated in Provision.
 	query := fmt.Sprintf("SELECT %s, %s FROM %s ORDER BY %s DESC, %s DESC LIMIT 1",
 		s.UpdatedAtColumn, s.KeyColumn, s.Table, s.UpdatedAtColumn, s.KeyColumn)
 
@@ -594,7 +594,7 @@ func (s *SQLSource) refreshIncremental() error {
 	cursorKey := s.incCursorKey
 	s.cursorMu.Unlock()
 
-	//nolint:gosec,nolintlint // identifiers are validated in Provision
+	// #nosec G201 -- identifiers are validated in Provision; values use placeholders.
 	query := fmt.Sprintf(
 		"SELECT %s, %s, %s FROM %s WHERE (%s > $1) OR (%s = $1 AND %s > $2) ORDER BY %s ASC, %s ASC",
 		s.KeyColumn, s.ConfigColumn, s.UpdatedAtColumn, s.Table,
@@ -604,7 +604,7 @@ func (s *SQLSource) refreshIncremental() error {
 	args := []any{cursorTime, cursorKey}
 
 	if s.DeletedAtColumn != "" {
-		//nolint:gosec,nolintlint // identifiers are validated in Provision
+		// #nosec G201 -- identifiers are validated in Provision; values use placeholders.
 		query = fmt.Sprintf(
 			"SELECT %s, %s, %s, %s FROM %s WHERE (%s > $1) OR (%s = $1 AND %s > $2) ORDER BY %s ASC, %s ASC",
 			s.KeyColumn, s.ConfigColumn, s.UpdatedAtColumn, s.DeletedAtColumn, s.Table,
@@ -614,7 +614,7 @@ func (s *SQLSource) refreshIncremental() error {
 	}
 
 	if s.Driver == "mysql" {
-		//nolint:gosec,nolintlint // identifiers are validated in Provision
+		// #nosec G201 -- identifiers are validated in Provision; values use placeholders.
 		query = fmt.Sprintf(
 			"SELECT %s, %s, %s FROM %s WHERE (%s > ?) OR (%s = ? AND %s > ?) ORDER BY %s ASC, %s ASC",
 			s.KeyColumn, s.ConfigColumn, s.UpdatedAtColumn, s.Table,
@@ -623,7 +623,7 @@ func (s *SQLSource) refreshIncremental() error {
 		)
 		args = []any{cursorTime, cursorTime, cursorKey}
 		if s.DeletedAtColumn != "" {
-			//nolint:gosec,nolintlint // identifiers are validated in Provision
+			// #nosec G201 -- identifiers are validated in Provision; values use placeholders.
 			query = fmt.Sprintf(
 				"SELECT %s, %s, %s, %s FROM %s WHERE (%s > ?) OR (%s = ? AND %s > ?) ORDER BY %s ASC, %s ASC",
 				s.KeyColumn, s.ConfigColumn, s.UpdatedAtColumn, s.DeletedAtColumn, s.Table,

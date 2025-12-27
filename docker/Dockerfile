@@ -5,7 +5,7 @@ ENV GOTOOLCHAIN=auto
 RUN apk add --no-cache git
 
 # Install xcaddy
-RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.5
 
 # Copy source code
 WORKDIR /src

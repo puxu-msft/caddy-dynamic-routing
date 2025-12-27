@@ -11,6 +11,52 @@ import (
 	"testing"
 )
 
+func stripFencedCodeBlocks(markdown string) string {
+	// Simple line-based fence stripper: remove content inside ``` or ~~~ fenced blocks.
+	// This reduces false positives for links that appear in examples.
+	lines := strings.Split(markdown, "\n")
+	out := make([]string, 0, len(lines))
+	inFence := false
+	fenceMarker := ""
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			marker := trimmed[:3]
+			if !inFence {
+				inFence = true
+				fenceMarker = marker
+				continue
+			}
+			// Closing fence: must match the opening marker type.
+			if fenceMarker == marker {
+				inFence = false
+				fenceMarker = ""
+				continue
+			}
+		}
+
+		if inFence {
+			continue
+		}
+		out = append(out, line)
+	}
+
+	return strings.Join(out, "\n")
+}
+
+func firstTokenBeforeWhitespace(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
 func TestDocs_LocalMarkdownLinksResolve(t *testing.T) {
 	skipDirs := map[string]struct{}{
 		".git": {},
@@ -51,6 +97,7 @@ func TestDocs_LocalMarkdownLinksResolve(t *testing.T) {
 		}
 
 		content := string(b)
+		content = stripFencedCodeBlocks(content)
 		var targets []string
 
 		for _, m := range inlineLinkRe.FindAllStringSubmatch(content, -1) {
@@ -71,6 +118,9 @@ func TestDocs_LocalMarkdownLinksResolve(t *testing.T) {
 			target := strings.TrimSpace(rawTarget)
 			target = strings.Trim(target, "<>")
 			target = strings.Trim(target, `"'`)
+
+			// Handle optional link titles: (path "title") or (path 'title').
+			target = firstTokenBeforeWhitespace(target)
 
 			if target == "" {
 				continue

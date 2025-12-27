@@ -290,12 +290,12 @@ func (s *UpstreamSelector) selectWeightedRandom(upstreams []datasource.WeightedU
 	}
 
 	if totalWeight <= 0 {
-		//nolint:gosec // non-cryptographic randomness is sufficient for load balancing
+		// #nosec G404 -- non-cryptographic randomness is sufficient for load balancing
 		idx := rand.Intn(len(upstreams))
 		return &upstreams[idx]
 	}
 
-	//nolint:gosec // non-cryptographic randomness is sufficient for load balancing
+	// #nosec G404 -- non-cryptographic randomness is sufficient for load balancing
 	target := rand.Intn(totalWeight)
 	cumulative := 0
 

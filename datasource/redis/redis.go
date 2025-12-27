@@ -203,6 +203,7 @@ func (r *RedisSource) createClient() redis.UniversalClient {
 	var tlsConfig *tls.Config
 	if r.TLSEnabled {
 		tlsConfig = &tls.Config{
+			// #nosec G402 -- configurable for dev/test environments; default is secure verification.
 			InsecureSkipVerify: r.TLSSkipVerify,
 		}
 	}
