@@ -45,6 +45,14 @@ type DynamicSelection struct {
 	//   - "{query.tenant}" - use query parameter
 	Key string `json:"key,omitempty"`
 
+	// InstanceKey is the placeholder expression used to extract an instance-specific routing key.
+	// When set, the policy will prefer instance-level routing first, then fall back.
+	InstanceKey string `json:"instance_key,omitempty"`
+
+	// VersionKey is the placeholder expression used to extract a version-level routing key.
+	// Used as fallback when InstanceKey is set but does not yield an available upstream.
+	VersionKey string `json:"version_key,omitempty"`
+
 	// DataSourceRaw is the raw JSON configuration for the data source.
 	// The data source must implement the datasource.DataSource interface.
 	DataSourceRaw json.RawMessage `json:"data_source,omitempty" caddy:"namespace=http.reverse_proxy.selection_policies.dynamic.sources inline_key=source"`
@@ -60,12 +68,15 @@ type DynamicSelection struct {
 	MetricsCardinality string `json:"metrics_cardinality,omitempty"`
 
 	// Internal fields
-	keyExtractor       extractor.KeyExtractor
-	dataSource         datasource.DataSource
-	fallback           reverseproxy.Selector
-	ruleMatcher        *matcher.RuleMatcher
-	logger             *zap.Logger
-	dataSourceTypeName string // Cached for metrics (computed in Provision)
+	keyExtractor         extractor.KeyExtractor
+	instanceKeyExtractor extractor.KeyExtractor
+	versionKeyExtractor  extractor.KeyExtractor
+	dataSource           datasource.DataSource
+	fallback             reverseproxy.Selector
+	ruleMatcher          *matcher.RuleMatcher
+	logger               *zap.Logger
+	dataSourceTypeName   string // Cached for metrics (computed in Provision)
+	isUpstreamAvailable  func(*reverseproxy.Upstream) bool
 
 	// Pool index for O(1) upstream lookup (built lazily)
 	poolIndex    map[string]*reverseproxy.Upstream
@@ -86,6 +97,9 @@ func (DynamicSelection) CaddyModule() caddy.ModuleInfo {
 func (s *DynamicSelection) Provision(ctx caddy.Context) error {
 	s.logger = ctx.Logger()
 	s.ruleMatcher = matcher.NewRuleMatcher()
+	if s.isUpstreamAvailable == nil {
+		s.isUpstreamAvailable = func(u *reverseproxy.Upstream) bool { return u.Available() }
+	}
 
 	if s.MetricsCardinality != "" {
 		if err := metrics.SetRouteMetricsCardinalityFromString(s.MetricsCardinality); err != nil {
@@ -93,12 +107,26 @@ func (s *DynamicSelection) Provision(ctx caddy.Context) error {
 		}
 	}
 
-	// Parse key expression
+	// Parse key expressions
 	if s.Key != "" {
 		var err error
 		s.keyExtractor, err = extractor.NewFromExpression(s.Key)
 		if err != nil {
 			return fmt.Errorf("parsing key expression: %v", err)
+		}
+	}
+	if s.InstanceKey != "" {
+		var err error
+		s.instanceKeyExtractor, err = extractor.NewFromExpression(s.InstanceKey)
+		if err != nil {
+			return fmt.Errorf("parsing instance_key expression: %v", err)
+		}
+	}
+	if s.VersionKey != "" {
+		var err error
+		s.versionKeyExtractor, err = extractor.NewFromExpression(s.VersionKey)
+		if err != nil {
+			return fmt.Errorf("parsing version_key expression: %v", err)
 		}
 	}
 
@@ -130,6 +158,8 @@ func (s *DynamicSelection) Provision(ctx caddy.Context) error {
 	s.adminName = registerSelectionPolicy(SelectionPolicyInfo{
 		ModuleID:           "http.reverse_proxy.selection_policies.dynamic",
 		Key:                s.Key,
+		InstanceKey:        s.InstanceKey,
+		VersionKey:         s.VersionKey,
 		DataSourceType:     s.dataSourceTypeForAdmin(),
 		DataSourceModuleID: s.dataSourceModuleID(),
 		FallbackPolicy:     s.fallbackPolicyID(),
@@ -137,6 +167,8 @@ func (s *DynamicSelection) Provision(ctx caddy.Context) error {
 
 	s.logger.Info("dynamic selection policy provisioned",
 		zap.String("key", s.Key),
+		zap.String("instance_key", s.InstanceKey),
+		zap.String("version_key", s.VersionKey),
 		zap.Bool("has_datasource", s.dataSource != nil),
 	)
 
@@ -204,117 +236,142 @@ func (s *DynamicSelection) Select(pool reverseproxy.UpstreamPool, r *http.Reques
 		return s.fallback.Select(pool, r, w)
 	}
 
-	// If no key extractor or data source, use fallback
-	if s.keyExtractor == nil || s.dataSource == nil {
-		if s.keyExtractor == nil {
-			metrics.RecordRouteMiss("", metrics.MissReasonNoKeyExtractor)
-			routeStatsRegistry.RecordMiss("", string(metrics.MissReasonNoKeyExtractor))
-		} else {
-			metrics.RecordRouteMiss("", metrics.MissReasonNoDataSource)
-			routeStatsRegistry.RecordMiss("", string(metrics.MissReasonNoDataSource))
+	// If no data source, use fallback
+	if s.dataSource == nil {
+		metrics.RecordRouteMiss("", metrics.MissReasonNoDataSource)
+		routeStatsRegistry.RecordMiss("", string(metrics.MissReasonNoDataSource))
+		return s.fallback.Select(pool, r, w)
+	}
+
+	// Determine routing mode.
+	useInstanceVersion := s.instanceKeyExtractor != nil || s.versionKeyExtractor != nil
+	if !useInstanceVersion && s.keyExtractor == nil {
+		metrics.RecordRouteMiss("", metrics.MissReasonNoKeyExtractor)
+		routeStatsRegistry.RecordMiss("", string(metrics.MissReasonNoKeyExtractor))
+		return s.fallback.Select(pool, r, w)
+	}
+	if useInstanceVersion && s.instanceKeyExtractor == nil && s.versionKeyExtractor == nil {
+		metrics.RecordRouteMiss("", metrics.MissReasonNoKeyExtractor)
+		routeStatsRegistry.RecordMiss("", string(metrics.MissReasonNoKeyExtractor))
+		return s.fallback.Select(pool, r, w)
+	}
+
+	// Helper: attempt routing for a given key extractor.
+	attempt := func(keyExt extractor.KeyExtractor) (key string, chosenAddr string, chosen *reverseproxy.Upstream, miss metrics.MissReason, ok bool) {
+		if keyExt == nil {
+			return "", "", nil, metrics.MissReasonNoKeyExtractor, false
 		}
-		return s.fallback.Select(pool, r, w)
-	}
-
-	// Extract routing key from request
-	key := s.keyExtractor.Extract(r, repl)
-	if key == "" {
-		s.logger.Debug("no routing key extracted, using fallback")
-		metrics.RecordRouteMiss("", metrics.MissReasonNoKey)
-		routeStatsRegistry.RecordMiss("", string(metrics.MissReasonNoKey))
-		return s.fallback.Select(pool, r, w)
-	}
-
-	// Read health for observability, but do NOT short-circuit on it.
-	// Data sources are expected to be able to serve cached configs even when unhealthy.
-	dsHealthy := s.dataSource.Healthy()
-
-	// Get routing configuration with timing
-	timer := metrics.NewTimer()
-	config, err := s.dataSource.Get(r.Context(), key)
-	timer.ObserveDuration(metrics.DataSourceLatency.WithLabelValues(s.dataSourceType()))
-
-	if err != nil {
-		s.logger.Warn("failed to get route config",
-			zap.String("key", key),
-			zap.Error(err),
-		)
-		metrics.RecordRouteMiss(key, metrics.MissReasonError)
-		routeStatsRegistry.RecordMiss(key, string(metrics.MissReasonError))
-		return s.fallback.Select(pool, r, w)
-	}
-
-	if config == nil {
-		if !dsHealthy {
-			s.logger.Debug("data source unhealthy and no cached config available, using fallback",
-				zap.String("key", key),
-			)
-			metrics.RecordRouteMiss(key, metrics.MissReasonUnhealthy)
-			routeStatsRegistry.RecordMiss(key, string(metrics.MissReasonUnhealthy))
-			return s.fallback.Select(pool, r, w)
+		key = keyExt.Extract(r, repl)
+		if key == "" {
+			return "", "", nil, metrics.MissReasonNoKey, false
 		}
 
-		s.logger.Debug("no route config found",
-			zap.String("key", key),
-		)
-		metrics.RecordRouteMiss(key, metrics.MissReasonNoConfig)
-		routeStatsRegistry.RecordMiss(key, string(metrics.MissReasonNoConfig))
+		dsHealthy := s.dataSource.Healthy()
+		timer := metrics.NewTimer()
+		config, err := s.dataSource.Get(r.Context(), key)
+		timer.ObserveDuration(metrics.DataSourceLatency.WithLabelValues(s.dataSourceType()))
+		if err != nil {
+			return key, "", nil, metrics.MissReasonError, false
+		}
+		if config == nil {
+			if !dsHealthy {
+				return key, "", nil, metrics.MissReasonUnhealthy, false
+			}
+			return key, "", nil, metrics.MissReasonNoConfig, false
+		}
+		if !config.IsEnabled() {
+			return key, "", nil, metrics.MissReasonDisabled, false
+		}
+		if config.IsExpired() {
+			return key, "", nil, metrics.MissReasonExpired, false
+		}
+
+		matchStart := time.Now()
+		matchRes := s.ruleMatcher.MatchResult(r, repl, config)
+		metrics.RuleMatchLatency.Observe(time.Since(matchStart).Seconds())
+		if matchRes == nil {
+			return key, "", nil, metrics.MissReasonNoMatch, false
+		}
+
+		inPool := make([]datasource.WeightedUpstream, 0, len(matchRes.Upstreams))
+		available := make([]datasource.WeightedUpstream, 0, len(matchRes.Upstreams))
+		for _, cand := range matchRes.Upstreams {
+			u := s.findUpstreamInPool(pool, cand.Address)
+			if u == nil {
+				continue
+			}
+			inPool = append(inPool, cand)
+			if s.isUpstreamAvailable != nil {
+				if !s.isUpstreamAvailable(u) {
+					continue
+				}
+			}
+			available = append(available, cand)
+		}
+		if len(inPool) == 0 {
+			return key, "", nil, metrics.MissReasonNotInPool, false
+		}
+		if len(available) == 0 {
+			return key, "", nil, metrics.MissReasonNoAvailableUpstream, false
+		}
+
+		selected := s.ruleMatcher.SelectFromUpstreams(r, available, matchRes.Algorithm, matchRes.AlgorithmKey)
+		if selected == nil {
+			return key, "", nil, metrics.MissReasonNoMatch, false
+		}
+		chosen = s.findUpstreamInPool(pool, selected.Address)
+		if chosen == nil {
+			return key, "", nil, metrics.MissReasonNotInPool, false
+		}
+		return key, selected.Address, chosen, "", true
+	}
+
+	// Multi-key mode: instance-prefer then version fallback.
+	if useInstanceVersion {
+		var instanceFail metrics.MissReason
+		instanceKey, instAddr, instUp, instMiss, instOK := attempt(s.instanceKeyExtractor)
+		if instOK {
+			s.logger.Debug("selected upstream via dynamic routing (instance)", zap.String("key", instanceKey), zap.String("upstream", instAddr))
+			metrics.RecordRouteHit(instanceKey, instAddr)
+			routeStatsRegistry.RecordHit(instanceKey, instAddr)
+			return instUp
+		}
+		instanceFail = instMiss
+
+		versionKey, verAddr, verUp, verMiss, verOK := attempt(s.versionKeyExtractor)
+		if verOK {
+			metrics.RecordInstanceFallback(instanceFail)
+			s.logger.Debug("selected upstream via dynamic routing (version)", zap.String("key", versionKey), zap.String("upstream", verAddr))
+			metrics.RecordRouteHit(versionKey, verAddr)
+			routeStatsRegistry.RecordHit(versionKey, verAddr)
+			return verUp
+		}
+
+		// Both attempts failed; attribute miss to the last attempted key if present.
+		missKey := versionKey
+		missReason := verMiss
+		if missKey == "" {
+			missKey = instanceKey
+			missReason = instanceFail
+		}
+		metrics.RecordRouteMiss(missKey, missReason)
+		routeStatsRegistry.RecordMiss(missKey, string(missReason))
 		return s.fallback.Select(pool, r, w)
 	}
 
-	if !config.IsEnabled() {
-		s.logger.Debug("route config disabled, using fallback",
-			zap.String("key", key),
-		)
-		metrics.RecordRouteMiss(key, metrics.MissReasonDisabled)
-		routeStatsRegistry.RecordMiss(key, string(metrics.MissReasonDisabled))
-		return s.fallback.Select(pool, r, w)
-	}
-
-	if config.IsExpired() {
-		s.logger.Debug("route config expired by ttl, using fallback",
-			zap.String("key", key),
-		)
-		metrics.RecordRouteMiss(key, metrics.MissReasonExpired)
-		routeStatsRegistry.RecordMiss(key, string(metrics.MissReasonExpired))
-		return s.fallback.Select(pool, r, w)
-	}
-
-	// Match rules and get target upstream with timing
-	matchStart := time.Now()
-	targetUpstream := s.ruleMatcher.Match(r, repl, config)
-	metrics.RuleMatchLatency.Observe(time.Since(matchStart).Seconds())
-
-	if targetUpstream == nil {
-		s.logger.Debug("no matching rule found",
-			zap.String("key", key),
-		)
-		metrics.RecordRouteMiss(key, metrics.MissReasonNoMatch)
-		routeStatsRegistry.RecordMiss(key, string(metrics.MissReasonNoMatch))
-		return s.fallback.Select(pool, r, w)
-	}
-
-	// Find the upstream in the pool
-	upstream := s.findUpstreamInPool(pool, targetUpstream.Address)
-	if upstream == nil {
-		s.logger.Debug("matched upstream not in pool",
-			zap.String("key", key),
-			zap.String("target", targetUpstream.Address),
-		)
-		metrics.RecordRouteMiss(key, metrics.MissReasonNotInPool)
-		routeStatsRegistry.RecordMiss(key, string(metrics.MissReasonNotInPool))
+	key, addr, upstream, miss, ok := attempt(s.keyExtractor)
+	if !ok {
+		metrics.RecordRouteMiss(key, miss)
+		routeStatsRegistry.RecordMiss(key, string(miss))
 		return s.fallback.Select(pool, r, w)
 	}
 
 	s.logger.Debug("selected upstream via dynamic routing",
 		zap.String("key", key),
-		zap.String("upstream", targetUpstream.Address),
+		zap.String("upstream", addr),
 	)
-
-	// Record successful route hit
-	metrics.RecordRouteHit(key, targetUpstream.Address)
-	routeStatsRegistry.RecordHit(key, targetUpstream.Address)
-
+	metrics.RecordRouteHit(key, addr)
+	routeStatsRegistry.RecordHit(key, addr)
 	return upstream
 }
 

@@ -33,6 +33,33 @@ func TestRuleMatcher_Match_SimpleMode(t *testing.T) {
 	}
 }
 
+func TestRuleMatcher_MatchResult_SimpleMode(t *testing.T) {
+	m := NewRuleMatcher()
+
+	config := &datasource.RouteConfig{
+		Upstream:     "backend:8080",
+		Algorithm:    string(AlgorithmRoundRobin),
+		AlgorithmKey: "",
+	}
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	repl := caddy.NewReplacer()
+
+	res := m.MatchResult(req, repl, config)
+	if res == nil {
+		t.Fatal("Expected non-nil MatchResult")
+	}
+	if !res.MatchedSimple {
+		t.Fatalf("Expected MatchedSimple=true")
+	}
+	if res.Algorithm != string(AlgorithmRoundRobin) {
+		t.Fatalf("Expected algorithm %q, got %q", AlgorithmRoundRobin, res.Algorithm)
+	}
+	if len(res.Upstreams) != 1 || res.Upstreams[0].Address != "backend:8080" {
+		t.Fatalf("Expected single candidate backend:8080, got %#v", res.Upstreams)
+	}
+}
+
 func TestRuleMatcher_Match_NilConfig(t *testing.T) {
 	m := NewRuleMatcher()
 

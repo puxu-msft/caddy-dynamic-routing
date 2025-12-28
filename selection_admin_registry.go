@@ -12,6 +12,8 @@ type SelectionPolicyInfo struct {
 	Name               string `json:"name"`
 	ModuleID           string `json:"module_id"`
 	Key                string `json:"key,omitempty"`
+	InstanceKey        string `json:"instance_key,omitempty"`
+	VersionKey         string `json:"version_key,omitempty"`
 	DataSourceType     string `json:"data_source_type,omitempty"`
 	DataSourceModuleID string `json:"data_source_module_id,omitempty"`
 	FallbackPolicy     string `json:"fallback_policy,omitempty"`

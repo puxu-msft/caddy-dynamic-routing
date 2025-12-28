@@ -361,6 +361,100 @@ func TestDynamicSelection_Select_UpstreamNotInPool(t *testing.T) {
 	}
 }
 
+func TestDynamicSelection_Select_InstancePrefer_FallbackToVersion_WhenInstanceUnavailable(t *testing.T) {
+	instanceExt, _ := extractor.NewFromExpression("{http.vars.route_instance_key}")
+	versionExt, _ := extractor.NewFromExpression("{http.vars.route_version_key}")
+
+	mock := &mockDataSource{
+		configs: map[string]*datasource.RouteConfig{
+			"t/s/v/i": {Upstream: "backend-i:8080"},
+			"t/s/v":   {Upstream: "backend-v:8080"},
+		},
+		healthy: true,
+	}
+
+	s := &DynamicSelection{
+		logger:               zap.NewNop(),
+		fallback:             new(reverseproxy.RandomSelection),
+		instanceKeyExtractor: instanceExt,
+		versionKeyExtractor:  versionExt,
+		dataSource:           mock,
+		ruleMatcher:          matcher.NewRuleMatcher(),
+		isUpstreamAvailable:  func(u *reverseproxy.Upstream) bool { return u.Dial != "backend-i:8080" },
+	}
+
+	pool := reverseproxy.UpstreamPool{
+		{Dial: "backend-i:8080"},
+		{Dial: "backend-v:8080"},
+	}
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	repl := caddy.NewReplacer()
+	repl.Set("http.vars.route_instance_key", "t/s/v/i")
+	repl.Set("http.vars.route_version_key", "t/s/v")
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	req = req.WithContext(ctx)
+
+	result := s.Select(pool, req, nil)
+	if result == nil {
+		t.Fatal("Expected non-nil result")
+	}
+	if result.Dial != "backend-v:8080" {
+		t.Fatalf("Expected fallback to version upstream 'backend-v:8080', got %q", result.Dial)
+	}
+}
+
+func TestDynamicSelection_Select_FiltersUnavailableCandidates(t *testing.T) {
+	keyExt, _ := extractor.NewFromExpression("{header.X-Tenant}")
+
+	mock := &mockDataSource{
+		configs: map[string]*datasource.RouteConfig{
+			"tenant-a": {
+				Algorithm: string(matcher.AlgorithmFirst),
+				Rules: []datasource.Rule{
+					{
+						Match: map[string]string{},
+						Upstreams: []datasource.WeightedUpstream{
+							{Address: "backend-a:8080", Weight: 1},
+							{Address: "backend-b:8080", Weight: 1},
+						},
+						Priority: 0,
+					},
+				},
+			},
+		},
+		healthy: true,
+	}
+
+	s := &DynamicSelection{
+		logger:              zap.NewNop(),
+		fallback:            new(reverseproxy.RandomSelection),
+		keyExtractor:        keyExt,
+		dataSource:          mock,
+		ruleMatcher:         matcher.NewRuleMatcher(),
+		isUpstreamAvailable: func(u *reverseproxy.Upstream) bool { return u.Dial != "backend-a:8080" },
+	}
+
+	pool := reverseproxy.UpstreamPool{
+		{Dial: "backend-a:8080"},
+		{Dial: "backend-b:8080"},
+	}
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	repl := caddy.NewReplacer()
+	repl.Set("http.request.header.X-Tenant", "tenant-a")
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	req = req.WithContext(ctx)
+
+	result := s.Select(pool, req, nil)
+	if result == nil {
+		t.Fatal("Expected non-nil result")
+	}
+	if result.Dial != "backend-b:8080" {
+		t.Fatalf("Expected unavailable candidate to be filtered and select 'backend-b:8080', got %q", result.Dial)
+	}
+}
+
 func TestDynamicSelection_FindUpstreamInPool(t *testing.T) {
 	s := &DynamicSelection{}
 

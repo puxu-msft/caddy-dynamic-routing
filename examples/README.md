@@ -19,6 +19,7 @@ Configuration examples for caddy-dynamic-routing.
 | [dev-debug/](dev-debug/) | Enabling debug logs for troubleshooting |
 | [metrics-cardinality/](metrics-cardinality/) | Reducing Prometheus time-series cardinality |
 | [metrics/](metrics/) | Metrics reference (names, labels, cardinality notes) |
+| [gateway-jwt/](gateway-jwt/) | JWT gateway sets routing keys; instance-prefer with version fallback |
 
 ## Files
 

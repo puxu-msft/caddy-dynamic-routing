@@ -1,0 +1,30 @@
+:8080 {
+	# Verifies the JWT and sets:
+	# - {http.vars.route_instance_key}
+	# - {http.vars.route_version_key}
+	gateway_jwt {
+		jwks_url http://127.0.0.1:9000/jwks.json
+		allow_insecure_jwks
+		issuer example-issuer
+		audience example-audience
+		trusted_source 127.0.0.1/32
+	}
+
+	reverse_proxy 127.0.0.1:9101 127.0.0.1:9102 127.0.0.1:9103 {
+		health_uri /health
+		health_interval 1s
+		health_timeout 1s
+
+		lb_policy_dynamic {
+			instance_key {http.vars.route_instance_key}
+			version_key {http.vars.route_version_key}
+
+			file {
+				path ./examples/gateway-jwt/routes.json
+				watch true
+			}
+
+			fallback random
+		}
+	}
+}

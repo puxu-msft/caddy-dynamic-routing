@@ -175,6 +175,18 @@ var (
 		},
 	)
 
+	// InstanceFallbacks tracks how often instance-prefer routing falls back to version routing.
+	// This is intentionally low-cardinality: reason is one of a small fixed set.
+	InstanceFallbacks = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      "instance_fallbacks_total",
+			Help:      "Total number of instance->version fallbacks by reason",
+		},
+		[]string{"reason"},
+	)
+
 	// WatchEvents tracks watch events by source type and event type.
 	WatchEvents = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -270,17 +282,18 @@ type MissReason string
 
 // MissReason constants enumerate the possible reasons for a route miss.
 const (
-	MissReasonNoKey          MissReason = "no_key"
-	MissReasonNoConfig       MissReason = "no_config"
-	MissReasonNoMatch        MissReason = "no_match"
-	MissReasonNotInPool      MissReason = "not_in_pool"
-	MissReasonUnhealthy      MissReason = "unhealthy"
-	MissReasonError          MissReason = "error"
-	MissReasonDisabled       MissReason = "disabled"
-	MissReasonExpired        MissReason = "expired"
-	MissReasonNoReplacer     MissReason = "no_replacer"
-	MissReasonNoDataSource   MissReason = "no_datasource"
-	MissReasonNoKeyExtractor MissReason = "no_key_extractor"
+	MissReasonNoKey               MissReason = "no_key"
+	MissReasonNoConfig            MissReason = "no_config"
+	MissReasonNoMatch             MissReason = "no_match"
+	MissReasonNotInPool           MissReason = "not_in_pool"
+	MissReasonUnhealthy           MissReason = "unhealthy"
+	MissReasonError               MissReason = "error"
+	MissReasonDisabled            MissReason = "disabled"
+	MissReasonExpired             MissReason = "expired"
+	MissReasonNoReplacer          MissReason = "no_replacer"
+	MissReasonNoDataSource        MissReason = "no_datasource"
+	MissReasonNoKeyExtractor      MissReason = "no_key_extractor"
+	MissReasonNoAvailableUpstream MissReason = "no_available_upstream"
 )
 
 // Timer is a helper for timing operations.
@@ -314,6 +327,14 @@ func RecordRouteMiss(key string, reason MissReason) {
 		return
 	}
 	RouteMisses.WithLabelValues(key, string(reason)).Inc()
+}
+
+// RecordInstanceFallback records an instance->version fallback event.
+func RecordInstanceFallback(reason MissReason) {
+	if reason == "" {
+		reason = MissReasonError
+	}
+	InstanceFallbacks.WithLabelValues(string(reason)).Inc()
 }
 
 // RecordRouteConfigParseError records a route-config parse error for a given data source type.

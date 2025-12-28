@@ -27,6 +27,16 @@ type RuleMatcher struct {
 	selectorCache *lru.Cache // map[string]*UpstreamSelector
 }
 
+// MatchResult describes the upstream candidates and selection algorithm for a matched rule.
+// It is useful when callers need to pre-filter candidates (e.g. by pool membership or health)
+// before applying the selection algorithm.
+type MatchResult struct {
+	Upstreams     []datasource.WeightedUpstream
+	Algorithm     string
+	AlgorithmKey  string
+	MatchedSimple bool
+}
+
 // NewRuleMatcher creates a new RuleMatcher.
 func NewRuleMatcher() *RuleMatcher {
 	return NewRuleMatcherWithCacheSizes(defaultRegexCacheSize, defaultSelectorCacheSize)
@@ -105,16 +115,18 @@ func (m *RuleMatcher) getSelector(algorithm, algorithmKey string) *UpstreamSelec
 // Match finds the best matching upstream for the request based on the route config.
 // Returns nil if no match is found.
 func (m *RuleMatcher) Match(r *http.Request, repl *caddy.Replacer, config *datasource.RouteConfig) *datasource.WeightedUpstream {
-	if config == nil {
+	res := m.MatchResult(r, repl, config)
+	if res == nil {
 		return nil
 	}
+	return m.selectUpstream(r, res.Upstreams, res.Algorithm, res.AlgorithmKey)
+}
 
-	// Simple mode: direct upstream
-	if config.Upstream != "" && len(config.Rules) == 0 {
-		return &datasource.WeightedUpstream{
-			Address: config.Upstream,
-			Weight:  1,
-		}
+// MatchResult finds the best matching rule and returns its upstream candidates and selection algorithm.
+// Returns nil if no match is found.
+func (m *RuleMatcher) MatchResult(r *http.Request, repl *caddy.Replacer, config *datasource.RouteConfig) *MatchResult {
+	if config == nil {
+		return nil
 	}
 
 	// Default algorithm
@@ -124,10 +136,19 @@ func (m *RuleMatcher) Match(r *http.Request, repl *caddy.Replacer, config *datas
 	}
 	defaultAlgorithmKey := config.AlgorithmKey
 
+	// Simple mode: direct upstream
+	if config.Upstream != "" && len(config.Rules) == 0 {
+		return &MatchResult{
+			Upstreams:     []datasource.WeightedUpstream{{Address: config.Upstream, Weight: 1}},
+			Algorithm:     defaultAlgorithm,
+			AlgorithmKey:  defaultAlgorithmKey,
+			MatchedSimple: true,
+		}
+	}
+
 	// Advanced mode: evaluate rules (already sorted by priority)
 	for _, rule := range config.Rules {
 		if m.matchConditions(r, repl, rule.Match) {
-			// Determine algorithm for this rule
 			algorithm := rule.Algorithm
 			if algorithm == "" {
 				algorithm = defaultAlgorithm
@@ -137,11 +158,21 @@ func (m *RuleMatcher) Match(r *http.Request, repl *caddy.Replacer, config *datas
 				algorithmKey = defaultAlgorithmKey
 			}
 
-			return m.selectUpstream(r, rule.Upstreams, algorithm, algorithmKey)
+			return &MatchResult{
+				Upstreams:    rule.Upstreams,
+				Algorithm:    algorithm,
+				AlgorithmKey: algorithmKey,
+			}
 		}
 	}
 
 	return nil
+}
+
+// SelectFromUpstreams selects an upstream from a candidate list using the configured algorithm.
+// This is intended for callers that pre-filter candidates before selection.
+func (m *RuleMatcher) SelectFromUpstreams(r *http.Request, upstreams []datasource.WeightedUpstream, algorithm, algorithmKey string) *datasource.WeightedUpstream {
+	return m.selectUpstream(r, upstreams, algorithm, algorithmKey)
 }
 
 // selectUpstream selects an upstream using the specified algorithm.

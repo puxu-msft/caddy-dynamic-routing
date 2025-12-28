@@ -25,6 +25,8 @@ func init() {
 //
 //	lb_policy dynamic {
 //	    key {http.request.header.X-Tenant}
+//	    instance_key {http.vars.route_instance_key}
+//	    version_key {http.vars.route_version_key}
 //
 //	    etcd {
 //	        endpoints localhost:2379 localhost:2380
@@ -83,6 +85,18 @@ func (s *DynamicSelection) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				s.Key = d.Val()
+
+			case "instance_key":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				s.InstanceKey = d.Val()
+
+			case "version_key":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				s.VersionKey = d.Val()
 
 			case "metrics_cardinality":
 				if !d.NextArg() {
